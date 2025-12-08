@@ -1,0 +1,5 @@
+{
+  "name": "AutoSchematic AI",
+  "description": "A next-generation AI-Powered Electronic Design Automation (EDA) Suite. Converts high-level text requests into fully realized component BOMs and interactive schematics using Gemini models.",
+  "requestFramePermissions": []
+}
