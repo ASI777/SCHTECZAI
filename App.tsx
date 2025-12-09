@@ -15,8 +15,9 @@ import {
   analyzePins,
   generateNetlist, 
   checkSystemCompatibility,
-  fileToGenerativePart
+  searchComponentData
 } from './services/geminiService';
+import { generateKiCadSchematic } from './services/exportService';
 import { ArchitectureDiagram } from './components/ArchitectureDiagram';
 import { SchematicView } from './components/SchematicView';
 import { 
@@ -36,7 +37,10 @@ import {
   Save,
   Plus,
   Trash2,
-  ArrowRight
+  ArrowRight,
+  Globe,
+  Loader2,
+  Download
 } from 'lucide-react';
 import { INITIAL_LOGS } from './constants';
 
@@ -57,6 +61,9 @@ const App: React.FC = () => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [compatibilityReport, setCompatibilityReport] = useState<CompatibilityReport | null>(null);
   
+  // Layout state for Export
+  const [schematicLayout, setSchematicLayout] = useState<Record<string, {x: number, y: number, w: number, h: number}>>({});
+
   const logsEndRef = useRef<HTMLDivElement>(null);
 
   // Load projects from local storage on mount
@@ -94,29 +101,19 @@ const App: React.FC = () => {
   };
 
   const saveProject = async () => {
-    addLog("Saving project and datasheets...", 'info', 'CLIENT');
+    addLog("Saving project...", 'info', 'CLIENT');
     
-    // Process components to store files as Base64 strings
-    const processedComponents = await Promise.all(components.map(async (c) => {
-      let dataUrl = c.datasheetUrl;
-      
-      // If there is a fresh file object, convert to Base64 for storage
-      if (c.datasheetFile && !c.datasheetUrl) {
-         try {
-           const { inlineData } = await fileToGenerativePart(c.datasheetFile);
-           dataUrl = `data:${c.datasheetFile.type};base64,${inlineData.data}`;
-         } catch (e) {
-           console.error("Failed to serialize file", e);
-         }
-      }
-      
-      // Return component with URL but without the File object (File object can't be JSON stringified)
+    // We cannot save full Base64 PDFs in localStorage due to 5MB limit.
+    // We will save the extracted data (pins, report) but strip the heavy datasheetUrl if it's base64.
+    const processedComponents = components.map(c => {
+      const isBase64 = c.datasheetUrl?.startsWith('data:');
       return {
         ...c,
-        datasheetUrl: dataUrl,
+        // Keep the URL if it's a web link, otherwise drop it to save space
+        datasheetUrl: isBase64 ? undefined : c.datasheetUrl, 
         datasheetFile: undefined 
       };
-    }));
+    });
 
     const newProject: Project = {
       id: projectId || `proj_${Date.now()}`,
@@ -140,7 +137,7 @@ const App: React.FC = () => {
     // Persist to local storage
     try {
       localStorage.setItem('eda_projects', JSON.stringify(updatedProjects));
-      addLog("Project saved successfully.", 'success', 'CLIENT');
+      addLog("Project saved successfully. (Note: Large PDF files are not persisted, only analysis data)", 'success', 'CLIENT');
     } catch (e) {
       addLog("Failed to save project. Storage limit exceeded?", 'error', 'CLIENT');
       console.error(e);
@@ -156,12 +153,8 @@ const App: React.FC = () => {
     setCompatibilityReport(project.compatibilityReport);
     setStage(project.stage);
     
-    // Hydrate components (convert Base64 URLs back to Files if needed, or just keep as URL)
-    // We primarily rely on the URL for display/logic now.
+    // Hydrate components
     const hydratedComponents = project.components.map(c => {
-       // Create a File object from Base64 if needed for APIs that strictly require File
-       // For Gemini, we can usually just pass the base64, but our service currently expects File.
-       // We will modify the service slightly or just rely on the fact that we have the analysis already.
        return { ...c };
     });
     setComponents(hydratedComponents);
@@ -175,6 +168,33 @@ const App: React.FC = () => {
     setProjects(updated);
     localStorage.setItem('eda_projects', JSON.stringify(updated));
   };
+
+  // --- Export Function ---
+  const handleDownloadCAD = () => {
+    if (!nets.length || !components.length) return;
+    addLog("Generating KiCad Schematic file...", 'info', 'BUILDER');
+    
+    try {
+      const kicadContent = generateKiCadSchematic({ components, nets }, schematicLayout);
+      
+      // Trigger Download
+      const blob = new Blob([kicadContent], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${projectName.replace(/\s+/g, '_')}_Schematic.kicad_sch`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      
+      addLog("KiCad Schematic downloaded. File is compatible with KiCad 6+ and Altium.", 'success', 'BUILDER');
+    } catch (e) {
+      console.error(e);
+      addLog("Failed to generate CAD file.", 'error', 'BUILDER');
+    }
+  };
+
 
   // --- Functional Logic ---
 
@@ -211,35 +231,70 @@ const App: React.FC = () => {
     setStage(AppStage.PROCESSING);
     setIsProcessing(true);
     setLogs([]);
+    
     // Update project name based on component if it's new
     if (projectName === "New Project" || projectName === "Untitled Project") {
       setProjectName(`${mainComponent} Design`);
     }
 
     try {
+      // 1. Generate BOM
       addLog("Generating BOM structure...", 'info', 'LLM_FLASH');
-      const generatedBOM = await generateBOM(mainComponent, appDescription);
-      setComponents(generatedBOM);
-      addLog(`BOM Generated: ${generatedBOM.length} components. Please upload datasheets for accuracy.`, 'success', 'LLM_FLASH');
+      let currentComponents = await generateBOM(mainComponent, appDescription);
+      setComponents(currentComponents);
+      addLog(`BOM Generated: ${currentComponents.length} components. Starting Auto-Search for Datasheets...`, 'success', 'LLM_FLASH');
       
-      setIsProcessing(false);
-      // We pause here to allow user to upload PDFs or proceed with auto-generation
+      // 2. Auto-Fetch Datasheets Loop
+      for (let i = 0; i < currentComponents.length; i++) {
+        const comp = currentComponents[i];
+        
+        // Update status to 'searching'
+        setComponents(prev => prev.map(c => c.id === comp.id ? { ...c, status: 'searching_datasheet' } : c));
+        
+        addLog(`Searching web for ${comp.name} datasheet & pinout...`, 'info', 'DATASHEET_SPIDER');
+        const searchResult = await searchComponentData(comp.name);
+        
+        if (searchResult.pins && searchResult.pins.length > 0) {
+           addLog(`Found data for ${comp.name}: ${searchResult.pins.length} pins.`, 'success', 'DATASHEET_SPIDER');
+           currentComponents[i] = {
+             ...comp,
+             pins: searchResult.pins,
+             description: searchResult.description || comp.description,
+             datasheetUrl: searchResult.datasheetUrl,
+             status: 'ready'
+           };
+        } else {
+           addLog(`Could not auto-fetch ${comp.name}. Using fallback estimation.`, 'warning', 'DATASHEET_SPIDER');
+           currentComponents[i] = {
+             ...comp,
+             status: 'pending' // Leaves it open for manual upload if user wants, but we will proceed
+           };
+        }
+        
+        // Update state progressively
+        setComponents([...currentComponents]);
+      }
+
+      addLog("Auto-Fetch Complete. Proceeding to System Compatibility Analysis...", 'info', 'CLIENT');
+      
+      // 3. Trigger Analysis automatically
+      await executeAnalysis(currentComponents);
+
     } catch (error) {
       addLog(`Error: ${error}`, 'error', 'CLIENT');
       setIsProcessing(false);
     }
   };
 
-  const handleRunAnalysis = async () => {
-    setIsProcessing(true);
-    setCompatibilityReport(null); // Reset report while running
+  const executeAnalysis = async (currentComponents: ComponentItem[]) => {
+    setCompatibilityReport(null); 
     addLog("Starting System Compatibility Check with Gemini 3.0 Pro...", 'info', 'LLM_PRO');
 
-    // 1. Fill in missing data (Auto-analyze those without PDFs)
-    const updatedComponents = [...components];
+    // 1. Fill in missing data (Auto-analyze those without PDFs or Web Data)
+    const updatedComponents = [...currentComponents];
     for (let i = 0; i < updatedComponents.length; i++) {
        if (!updatedComponents[i].pins || updatedComponents[i].pins?.length === 0) {
-         addLog(`No PDF for ${updatedComponents[i].name}. Running web-knowledge inference...`, 'warning', 'LLM_FLASH');
+         addLog(`No pinout for ${updatedComponents[i].name}. Running web-knowledge inference...`, 'warning', 'LLM_FLASH');
          const pins = await analyzePins(updatedComponents[i].name);
          updatedComponents[i].pins = pins;
          updatedComponents[i].status = 'ready';
@@ -261,9 +316,15 @@ const App: React.FC = () => {
        addLog("CAD Window Ready.", 'success', 'BUILDER');
     } else {
        addLog(`Compatibility Issues: ${report.issues.length} found. Review actions required.`, 'warning', 'LLM_PRO');
+       setStage(AppStage.PROCESSING); // Stay on processing/components view
     }
 
     setIsProcessing(false);
+  };
+
+  const handleRunAnalysis = async () => {
+    setIsProcessing(true);
+    await executeAnalysis(components);
   };
 
   // Iterative Loop: Apply Fixes
@@ -271,6 +332,7 @@ const App: React.FC = () => {
     if (!compatibilityReport?.actions) return;
 
     const newComponents = [...components];
+    const newItems: ComponentItem[] = [];
     
     compatibilityReport.actions.forEach((action: ComponentAction) => {
       if (action.type === 'REMOVE') {
@@ -283,21 +345,62 @@ const App: React.FC = () => {
         // Reuse logic: Check if exists
         const exists = newComponents.some(c => c.name.toLowerCase() === action.componentName.toLowerCase());
         if (!exists) {
-          addLog(`Adding ${action.componentName} to component list. Please upload datasheet.`, 'info', 'CLIENT');
-          newComponents.push({
+          addLog(`Adding ${action.componentName} to component list.`, 'info', 'CLIENT');
+          const newItem: ComponentItem = {
             id: `comp_auto_${Math.random().toString(36).substr(2, 5)}`,
             name: action.componentName,
             description: action.description || "Added by AI Recommendation",
             footprintType: "Unknown",
             status: 'pending'
-          });
+          };
+          newComponents.push(newItem);
+          newItems.push(newItem);
         }
       }
     });
 
     setComponents(newComponents);
-    setCompatibilityReport(null); // Clear report to restart loop
-    addLog("Component list updated. Please upload datasheets for new components and run analysis again.", 'info', 'CLIENT');
+    setCompatibilityReport(null); 
+    
+    // Auto-fetch for the new items immediately
+    if (newItems.length > 0) {
+      autoFetchNewItems(newComponents, newItems);
+    } else {
+       addLog("Adjustments made. Please Re-run Analysis.", 'info', 'CLIENT');
+    }
+  };
+
+  const autoFetchNewItems = async (allComponents: ComponentItem[], newItems: ComponentItem[]) => {
+    setIsProcessing(true);
+    addLog(`Auto-fetching data for ${newItems.length} new recommended components...`, 'info', 'DATASHEET_SPIDER');
+    
+    const updatedComponents = [...allComponents];
+
+    for (const newItem of newItems) {
+      const idx = updatedComponents.findIndex(c => c.id === newItem.id);
+      if (idx === -1) continue;
+
+      updatedComponents[idx] = { ...updatedComponents[idx], status: 'searching_datasheet' };
+      setComponents([...updatedComponents]); // Update UI
+
+      const searchResult = await searchComponentData(newItem.name);
+       if (searchResult.pins && searchResult.pins.length > 0) {
+           addLog(`Found data for ${newItem.name}.`, 'success', 'DATASHEET_SPIDER');
+           updatedComponents[idx] = {
+             ...updatedComponents[idx],
+             pins: searchResult.pins,
+             description: searchResult.description || updatedComponents[idx].description,
+             datasheetUrl: searchResult.datasheetUrl,
+             status: 'ready'
+           };
+        } else {
+           updatedComponents[idx].status = 'pending';
+        }
+        setComponents([...updatedComponents]);
+    }
+    
+    setIsProcessing(false);
+    addLog("New components ready. Click 'Run Analysis' to verify.", 'info', 'CLIENT');
   };
 
   return (
@@ -325,6 +428,12 @@ const App: React.FC = () => {
         )}
 
         <div className="flex items-center gap-4">
+           {stage === AppStage.SCHEMATIC && (
+             <button onClick={handleDownloadCAD} className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded text-sm transition-colors shadow-lg">
+               <Download size={14} /> Export KiCad
+             </button>
+           )}
+
           <button 
             onClick={() => setStage(AppStage.PROJECTS)} 
             className={`flex items-center gap-2 px-3 py-1.5 rounded text-sm hover:bg-slate-700 ${stage === AppStage.PROJECTS ? 'bg-cyan-900 text-cyan-200' : 'text-slate-400'}`}
@@ -430,24 +539,32 @@ const App: React.FC = () => {
                       <div className="flex justify-between items-start mb-2">
                         <span className="font-mono font-bold text-cyan-300">{c.name}</span>
                         <div className="flex items-center gap-2">
-                          {c.status === 'ready' && <CheckCircle size={14} className="text-green-500"/>}
-                          {(c.datasheetFile || c.datasheetUrl) && <FileText size={14} className="text-blue-400"/>}
+                           {c.status === 'searching_datasheet' && <Loader2 size={14} className="animate-spin text-cyan-500"/>}
+                           {c.status === 'ready' && <CheckCircle size={14} className="text-green-500"/>}
+                           {(c.datasheetFile) && <FileText size={14} className="text-blue-400"/>}
+                           {(c.datasheetUrl && !c.datasheetFile) && <Globe size={14} className="text-blue-400"/>}
                         </div>
                       </div>
                       <p className="text-xs text-slate-400 mb-3 line-clamp-2">{c.description}</p>
                       
-                      {/* Upload Button */}
+                      {/* Upload / Link Display */}
                       <div className="flex gap-2">
-                        <label className="flex-1 flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-600 text-slate-200 py-1.5 px-3 rounded cursor-pointer text-xs transition-colors">
-                          <Upload size={12} />
-                          {c.datasheetFile || c.datasheetUrl ? 'Update PDF' : 'Upload Datasheet'}
-                          <input 
-                            type="file" 
-                            accept=".pdf" 
-                            className="hidden" 
-                            onChange={(e) => handleFileUpload(e, c)}
-                          />
-                        </label>
+                         {c.datasheetUrl && !c.datasheetUrl.startsWith('data:') ? (
+                            <a href={c.datasheetUrl} target="_blank" rel="noopener noreferrer" className="flex-1 flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-600 text-cyan-400 py-1.5 px-3 rounded text-xs transition-colors">
+                               <Globe size={12} /> View Datasheet Source
+                            </a>
+                         ) : (
+                            <label className="flex-1 flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-600 text-slate-200 py-1.5 px-3 rounded cursor-pointer text-xs transition-colors">
+                              <Upload size={12} />
+                              {c.datasheetFile ? 'Update PDF' : 'Upload Manual PDF'}
+                              <input 
+                                type="file" 
+                                accept=".pdf" 
+                                className="hidden" 
+                                onChange={(e) => handleFileUpload(e, c)}
+                              />
+                            </label>
+                         )}
                       </div>
                     </div>
                   ))}
@@ -507,8 +624,9 @@ const App: React.FC = () => {
                         <label className="block text-sm font-medium text-slate-400 mb-2">Application Goal</label>
                         <textarea value={appDescription} onChange={(e) => setAppDescription(e.target.value)} className="w-full bg-eda-bg border border-eda-border rounded-lg px-4 py-3 text-white focus:ring-2 focus:ring-cyan-500 outline-none h-32 resize-none" />
                       </div>
-                      <button onClick={handleStartProcessing} className="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-bold py-4 rounded-lg flex items-center justify-center gap-2">
-                        <Play size={20} fill="currentColor" /> Initialize Design
+                      <button onClick={handleStartProcessing} disabled={isProcessing} className="w-full bg-cyan-600 hover:bg-cyan-500 disabled:bg-slate-600 disabled:cursor-not-allowed text-white font-bold py-4 rounded-lg flex items-center justify-center gap-2">
+                        {isProcessing ? <Loader2 size={20} className="animate-spin" /> : <Play size={20} fill="currentColor" />} 
+                        {isProcessing ? 'Initializing...' : 'Initialize Design'}
                       </button>
                     </div>
                   </div>
@@ -523,18 +641,23 @@ const App: React.FC = () => {
                 <div className="flex-1 h-full relative">
                     {/* Render Schematic if we have nets, otherwise just components placeholder */}
                     {(stage === AppStage.SCHEMATIC && nets.length > 0) ? (
-                      <SchematicView data={{ components, nets }} />
+                      <SchematicView 
+                        data={{ components, nets }} 
+                        onLayoutChange={setSchematicLayout}
+                      />
                     ) : (
                       <div className="w-full h-full flex flex-col items-center justify-center text-slate-400 bg-white">
                         <Activity size={48} className={`mb-4 ${isProcessing ? 'animate-spin text-cyan-500' : 'text-slate-300'}`} />
-                        <p className="text-lg font-medium">{isProcessing ? 'Analyzing System...' : 'Ready to Analyze'}</p>
-                        <p className="text-sm mt-2 text-slate-500">Upload datasheets for best results.</p>
+                        <p className="text-lg font-medium">{isProcessing ? 'Analyzing System & Fetching Datasheets...' : 'Ready to Analyze'}</p>
+                        <p className="text-sm mt-2 text-slate-500">
+                          {isProcessing ? "AI is searching the web for component specifications." : "Upload datasheets for best results."}
+                        </p>
                       </div>
                     )}
 
                     {/* Compatibility Overlay */}
                     {compatibilityReport && (
-                      <div className="absolute top-4 right-4 max-w-sm w-full bg-white/95 backdrop-blur shadow-xl border border-slate-200 rounded-lg p-4 animate-slideIn max-h-[80vh] overflow-auto">
+                      <div className="absolute top-4 right-4 max-w-sm w-full bg-white/95 backdrop-blur shadow-xl border border-slate-200 rounded-lg p-4 animate-slideIn max-h-[80vh] overflow-auto z-10">
                         <h4 className={`font-bold text-sm mb-2 flex items-center gap-2 ${compatibilityReport.isCompatible ? 'text-green-600' : 'text-red-600'}`}>
                           {compatibilityReport.isCompatible ? <CheckCircle size={16}/> : <AlertTriangle size={16}/>}
                           {compatibilityReport.isCompatible ? 'System Verified' : 'Attention Needed'}

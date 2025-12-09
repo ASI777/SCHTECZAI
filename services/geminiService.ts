@@ -80,7 +80,11 @@ export const analyzeDatasheetPDF = async (component: ComponentItem, file: File):
     3. Identify voltage levels and key operating conditions.
 
     Output a JSON object with 'pins' and a 'summary'.
-    For 'pins', assign a 'side' (left, right, top, bottom) based on typical schematic symbol conventions (Inputs left, Outputs right, Power top/bottom).
+    For 'pins', assign a 'side' (left, right, top, bottom) based on typical schematic symbol conventions:
+    - Top: Positive Power (VCC, VDD, 3V3, 5V, VBAT)
+    - Bottom: Ground (GND, VSS)
+    - Left: Inputs, Reset, Clock In, Control Signals
+    - Right: Outputs, Data Out, Communication Interfaces (TX, MOSI, SDA)
   `;
 
   try {
@@ -129,13 +133,88 @@ export const analyzeDatasheetPDF = async (component: ComponentItem, file: File):
   }
 };
 
+// 2b. Auto-Search Component Data (Web)
+export const searchComponentData = async (componentName: string): Promise<{ pins: PinDefinition[], datasheetUrl?: string, description?: string }> => {
+  const ai = getAI();
+  const prompt = `
+    Find the datasheet and pinout information for the electronic component: "${componentName}".
+    
+    1. Search for the component's pin configuration.
+    2. Return a list of pins with their number, name, and function.
+    3. Assign 'side' for a schematic symbol:
+       - Top: Power (VCC, VDD, 5V, 3.3V)
+       - Bottom: Ground (GND, VSS)
+       - Left: Inputs, Clocks, Resets
+       - Right: Outputs, Communication (TX/RX, SDA/SCL, MOSI/MISO)
+    4. Find a URL to the datasheet if possible.
+  `;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+      config: {
+        tools: [{ googleSearch: {} }]
+      }
+    });
+
+    // Extract grounding link for datasheet
+    const datasheetUrl = response.candidates?.[0]?.groundingMetadata?.groundingChunks?.[0]?.web?.uri || "";
+
+    // Now parse the text response into JSON using a second call or if the tool supports schema directly (Search tool usually returns text)
+    // We will do a second fast pass to format the text response into strict JSON
+    
+    const extractionPrompt = `
+      Extract the pinout data from this text into JSON:
+      ${response.text}
+    `;
+
+    const jsonResponse = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: extractionPrompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            description: { type: Type.STRING },
+            pins: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  pinNumber: { type: Type.STRING },
+                  name: { type: Type.STRING },
+                  type: { type: Type.STRING, enum: ['Power', 'Input', 'Output', 'IO', 'Clock', 'Passive'] },
+                  side: { type: Type.STRING, enum: ['left', 'right', 'top', 'bottom'] }
+                }
+              }
+            }
+          }
+        }
+      }
+    });
+
+    const data = JSON.parse(jsonResponse.text || "{}");
+    return {
+      pins: data.pins || [],
+      description: data.description || "",
+      datasheetUrl: datasheetUrl
+    };
+
+  } catch (error) {
+    console.error("Search Error:", error);
+    return { pins: [], datasheetUrl: "" };
+  }
+};
+
 // 3. Compatibility Check (Revised for Actions)
 export const checkSystemCompatibility = async (components: ComponentItem[]): Promise<CompatibilityReport> => {
   const ai = getAI();
   
   // Construct a context string from available analysis reports or names
   const systemContext = components.map(c => 
-    `Component: ${c.name}\nDescription: ${c.description}\nKnown Pins: ${c.pins?.map(p => p.name).join(', ')}`
+    `Component: ${c.name}\nDescription: ${c.description}\nKnown Pins: ${c.pins?.map(p => `${p.pinNumber}:${p.name}`).join(', ')}`
   ).join('\n---\n');
 
   const prompt = `
