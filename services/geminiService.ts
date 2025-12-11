@@ -1,6 +1,6 @@
 
 import { GoogleGenAI, Type } from "@google/genai";
-import { ComponentItem, Net, PinDefinition, CompatibilityReport } from "../types";
+import { ComponentItem, Net, PinDefinition, CompatibilityReport, PhysicalSpecs } from "../types";
 
 const getAI = () => new GoogleGenAI({ apiKey: process.env.API_KEY });
 
@@ -16,18 +16,26 @@ export const fileToGenerativePart = async (file: File): Promise<{ inlineData: { 
   };
 };
 
-// 1. Generate BOM
+// 1. Generate BOM (Context Aware)
 export const generateBOM = async (mainComponent: string, appDescription: string): Promise<ComponentItem[]> => {
   const ai = getAI();
   const prompt = `
-    You are an expert Electronic Design Automation (EDA) architect.
-    Design a minimal Bill of Materials (BOM) for the following application:
+    You are a Senior PCB Design Engineer. 
+    Create a precise Bill of Materials (BOM) for:
     Main Component: "${mainComponent}"
-    Target Application: "${appDescription}"
+    Application Context: "${appDescription}"
     
-    Return a list of 4-6 essential electronic components.
-    Include specific part numbers.
-    Identify the footprint type (e.g., DIP, SOP, 0603, 0805).
+    Goal: Identify the exact chipset, peripheral ICs, and essential protection circuitry required.
+    
+    Rules:
+    1. Include the main component.
+    2. Analyze the 'Application Context' for specific requirements:
+       - If "Automotive": Include TVS diodes, Reverse Polarity Protection (PFET/NFET), Load Dump protection.
+       - If "USB": Include ESD protection (USBLC6-2 or equivalent).
+       - If "Motor Control": Include Gate Drivers, Flyback diodes.
+    3. Include required power regulation (LDOs, Buck) matching the main component's voltage.
+    4. Include necessary passives (Decoupling 100nF/10uF, Crystal oscillators).
+    5. Return 5-10 distinct components.
   `;
 
   try {
@@ -46,7 +54,8 @@ export const generateBOM = async (mainComponent: string, appDescription: string)
                 properties: {
                   name: { type: Type.STRING },
                   description: { type: Type.STRING },
-                  footprintType: { type: Type.STRING }
+                  footprintType: { type: Type.STRING },
+                  manufacturer: { type: Type.STRING }
                 },
                 required: ["name", "description", "footprintType"]
               }
@@ -68,28 +77,53 @@ export const generateBOM = async (mainComponent: string, appDescription: string)
   }
 };
 
-// 2. Analyze Uploaded Datasheet PDF
-export const analyzeDatasheetPDF = async (component: ComponentItem, file: File): Promise<{ pins: PinDefinition[], report: string }> => {
+// 2. Analyze Uploaded Datasheet PDF (Deep Extraction)
+export const analyzeDatasheetPDF = async (component: ComponentItem, file: File, appContext: string = ""): Promise<{ 
+    pins: PinDefinition[], 
+    report: string, 
+    physicalSpecs: PhysicalSpecs, 
+    isolationRules: string[] 
+}> => {
   const ai = getAI();
   const filePart = await fileToGenerativePart(file);
 
   const prompt = `
-    Analyze this electronic component datasheet. 
-    1. Extract the comprehensive Pin Configuration / Pinout Table.
-    2. Determine the physical package characteristics.
-    3. Identify voltage levels and key operating conditions.
+    You are an expert EDA Engineer analyzing a datasheet.
+    Component: "${component.name}"
+    Application Context: "${appContext}"
 
-    Output a JSON object with 'pins' and a 'summary'.
-    For 'pins', assign a 'side' (left, right, top, bottom) based on typical schematic symbol conventions:
-    - Top: Positive Power (VCC, VDD, 3V3, 5V, VBAT)
-    - Bottom: Ground (GND, VSS)
-    - Left: Inputs, Reset, Clock In, Control Signals
-    - Right: Outputs, Data Out, Communication Interfaces (TX, MOSI, SDA)
+    Task: Extract deep technical specifications for Schematic Symbol creation and PCB Layout.
+
+    1. **Physical Dimensions (High Priority)**:
+       - Find "Package Outline" or "Mechanical Data".
+       - Extract Body Width/Height (mm).
+       - Extract Pin Pitch (mm).
+       - Identify Package Type.
+
+    2. **Electrical Characteristics**:
+       - Find "Absolute Maximum Ratings" and "Recommended Operating Conditions".
+       - Extract Max/Min Voltages for VCC and I/O.
+       - Identify Special behaviors (Open-Drain, True Open-Drain, 5V Tolerant).
+
+    3. **Isolation & Layout Rules**:
+       - Look for "Layout Guidelines".
+       - Are there requirements to separate AGND (Analog) from DGND (Digital)?
+       - Are there high-voltage creepage rules?
+
+    4. **Pin Configuration**:
+       - Extract ALL pins with Number, Name, Type.
+       - Assign "Side" for the schematic symbol:
+         - LEFT: Inputs, Reset, Clocks.
+         - RIGHT: Outputs, Interrupts, PWM.
+         - TOP: Power (VCC, VDD).
+         - BOTTOM: Ground (GND, VSS).
+
+    Return JSON.
   `;
 
   try {
     const response = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview', // Capable of multimodal PDF analysis
+      model: 'gemini-3-pro-preview', // Using Pro for complex reasoning and PDF analysis
       contents: {
         parts: [
           filePart,
@@ -102,6 +136,19 @@ export const analyzeDatasheetPDF = async (component: ComponentItem, file: File):
           type: Type.OBJECT,
           properties: {
             summary: { type: Type.STRING },
+            physicalSpecs: {
+              type: Type.OBJECT,
+              properties: {
+                widthMm: { type: Type.NUMBER },
+                heightMm: { type: Type.NUMBER },
+                pinPitchMm: { type: Type.NUMBER },
+                packageType: { type: Type.STRING }
+              }
+            },
+            isolationRules: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING }
+            },
             pins: {
               type: Type.ARRAY,
               items: {
@@ -111,7 +158,17 @@ export const analyzeDatasheetPDF = async (component: ComponentItem, file: File):
                   name: { type: Type.STRING },
                   type: { type: Type.STRING, enum: ['Power', 'Input', 'Output', 'IO', 'Clock', 'Passive'] },
                   side: { type: Type.STRING, enum: ['left', 'right', 'top', 'bottom'] },
-                  description: { type: Type.STRING }
+                  description: { type: Type.STRING },
+                  electrical: {
+                    type: Type.OBJECT,
+                    properties: {
+                       minVoltage: { type: Type.STRING },
+                       maxVoltage: { type: Type.STRING },
+                       maxCurrent: { type: Type.STRING },
+                       signalType: { type: Type.STRING },
+                       behavior: { type: Type.STRING }
+                    }
+                  }
                 },
                 required: ["pinNumber", "name", "type", "side"]
               }
@@ -122,31 +179,42 @@ export const analyzeDatasheetPDF = async (component: ComponentItem, file: File):
     });
 
     const json = JSON.parse(response.text || "{}");
-    return { pins: json.pins || [], report: json.summary || "Analysis complete." };
+    return { 
+        pins: json.pins || [], 
+        report: json.summary || "Deep analysis complete.",
+        physicalSpecs: json.physicalSpecs || { widthMm: 10, heightMm: 10, pinPitchMm: 2.54, packageType: "Unknown" },
+        isolationRules: json.isolationRules || []
+    };
   } catch (error) {
     console.error("PDF Analysis Error:", error);
     // Fallback stub
     return { 
       pins: [{ pinNumber: "1", name: "VCC", type: "Power", side: "top" }, { pinNumber: "2", name: "GND", type: "Power", side: "bottom" }], 
-      report: "Failed to parse PDF deeply. Using fallback data." 
+      report: "Failed to parse PDF deeply. Using fallback data.",
+      physicalSpecs: { widthMm: 10, heightMm: 10, pinPitchMm: 2.54, packageType: "Generic" },
+      isolationRules: []
     };
   }
 };
 
 // 2b. Auto-Search Component Data (Web)
-export const searchComponentData = async (componentName: string): Promise<{ pins: PinDefinition[], datasheetUrl?: string, description?: string }> => {
+export const searchComponentData = async (componentName: string, appContext: string = ""): Promise<{ 
+    pins: PinDefinition[], 
+    datasheetUrl?: string, 
+    description?: string,
+    physicalSpecs?: PhysicalSpecs,
+    isolationRules?: string[]
+}> => {
   const ai = getAI();
   const prompt = `
-    Find the datasheet and pinout information for the electronic component: "${componentName}".
+    Find technical data for electronic component: "${componentName}".
+    Application Context: "${appContext}".
     
-    1. Search for the component's pin configuration.
-    2. Return a list of pins with their number, name, and function.
-    3. Assign 'side' for a schematic symbol:
-       - Top: Power (VCC, VDD, 5V, 3.3V)
-       - Bottom: Ground (GND, VSS)
-       - Left: Inputs, Clocks, Resets
-       - Right: Outputs, Communication (TX/RX, SDA/SCL, MOSI/MISO)
-    4. Find a URL to the datasheet if possible.
+    1. Find Datasheet or Product Page.
+    2. Extract Pinout Table.
+    3. Extract Package Dimensions (Width x Height, Pitch).
+    4. Extract Electrical Ratings (Max Voltage, Logic Levels).
+    5. Look for isolation/grounding recommendations (e.g., "Single Point Grounding").
   `;
 
   try {
@@ -158,15 +226,14 @@ export const searchComponentData = async (componentName: string): Promise<{ pins
       }
     });
 
-    // Extract grounding link for datasheet
     const datasheetUrl = response.candidates?.[0]?.groundingMetadata?.groundingChunks?.[0]?.web?.uri || "";
 
-    // Now parse the text response into JSON using a second call or if the tool supports schema directly (Search tool usually returns text)
-    // We will do a second fast pass to format the text response into strict JSON
-    
     const extractionPrompt = `
-      Extract the pinout data from this text into JSON:
+      Based on this search result:
       ${response.text}
+
+      Extract structured JSON for schematic symbol generation.
+      Crucial: Physical Dimensions (mm) and Isolation Rules.
     `;
 
     const jsonResponse = await ai.models.generateContent({
@@ -178,6 +245,16 @@ export const searchComponentData = async (componentName: string): Promise<{ pins
           type: Type.OBJECT,
           properties: {
             description: { type: Type.STRING },
+            isolationRules: { type: Type.ARRAY, items: { type: Type.STRING } },
+            physicalSpecs: {
+                type: Type.OBJECT,
+                properties: {
+                  widthMm: { type: Type.NUMBER },
+                  heightMm: { type: Type.NUMBER },
+                  pinPitchMm: { type: Type.NUMBER },
+                  packageType: { type: Type.STRING }
+                }
+            },
             pins: {
               type: Type.ARRAY,
               items: {
@@ -186,7 +263,16 @@ export const searchComponentData = async (componentName: string): Promise<{ pins
                   pinNumber: { type: Type.STRING },
                   name: { type: Type.STRING },
                   type: { type: Type.STRING, enum: ['Power', 'Input', 'Output', 'IO', 'Clock', 'Passive'] },
-                  side: { type: Type.STRING, enum: ['left', 'right', 'top', 'bottom'] }
+                  side: { type: Type.STRING, enum: ['left', 'right', 'top', 'bottom'] },
+                  electrical: {
+                    type: Type.OBJECT,
+                    properties: {
+                       minVoltage: { type: Type.STRING },
+                       maxVoltage: { type: Type.STRING },
+                       maxCurrent: { type: Type.STRING },
+                       behavior: { type: Type.STRING }
+                    }
+                  }
                 }
               }
             }
@@ -199,7 +285,9 @@ export const searchComponentData = async (componentName: string): Promise<{ pins
     return {
       pins: data.pins || [],
       description: data.description || "",
-      datasheetUrl: datasheetUrl
+      datasheetUrl: datasheetUrl,
+      physicalSpecs: data.physicalSpecs,
+      isolationRules: data.isolationRules
     };
 
   } catch (error) {
@@ -208,29 +296,34 @@ export const searchComponentData = async (componentName: string): Promise<{ pins
   }
 };
 
-// 3. Compatibility Check (Revised for Actions)
-export const checkSystemCompatibility = async (components: ComponentItem[]): Promise<CompatibilityReport> => {
+// 3. Compatibility Check (Context Aware)
+export const checkSystemCompatibility = async (components: ComponentItem[], appDescription: string): Promise<CompatibilityReport> => {
   const ai = getAI();
   
-  // Construct a context string from available analysis reports or names
   const systemContext = components.map(c => 
-    `Component: ${c.name}\nDescription: ${c.description}\nKnown Pins: ${c.pins?.map(p => `${p.pinNumber}:${p.name}`).join(', ')}`
+    `Component: ${c.name} (${c.physicalSpecs?.packageType})
+     Desc: ${c.description}
+     Isolation Rules: ${c.isolationRules?.join(', ')}
+     Pins: ${c.pins?.map(p => 
+        `[${p.pinNumber}] ${p.name} 
+         (Type: ${p.type}, MaxV: ${p.electrical?.maxVoltage || '?'}, Behavior: ${p.electrical?.behavior || '?'})`
+     ).join(', ')}`
   ).join('\n---\n');
 
   const prompt = `
-    You are a Senior Electronics Engineer. Perform a rigorous design rule check (DRC) and compatibility analysis on this system.
+    You are a Lead Electronics Engineer performing a Design Rule Check (DRC).
+    Application Context: "${appDescription}"
     
+    Review the System Design below.
+    
+    Check for:
+    1. **Voltage Domain Mismatch**: (e.g. 5V logic driving 3.3V inputs without level shifting).
+    2. **Missing Pull-ups**: (e.g. Open-Drain I2C lines).
+    3. **Isolation Violations**: (e.g. Mixing High Voltage and Low Voltage grounds).
+    4. **Missing Protection**: (e.g. USB lines missing ESD protection).
+
     System Components:
     ${systemContext}
-
-    Your Task:
-    1. Check for Voltage level compatibility (e.g. 3.3V vs 5V logic).
-    2. Check for missing essential passives or auxiliary components (pull-ups, bypass caps, crystal oscillators, level shifters).
-    3. Check for Protocol mismatches (UART to SPI, etc.).
-    
-    If you find issues, propose specific actions:
-    - ADD: Add a missing component (e.g. "Level Shifter" or "10k Resistor").
-    - REMOVE: Remove a component that is wrong or redundant.
     
     Return a strict JSON report.
   `;
@@ -272,29 +365,32 @@ export const checkSystemCompatibility = async (components: ComponentItem[]): Pro
   }
 };
 
-// 4. Generate Netlist (Updated to use actual pins)
+// 4. Generate Netlist
 export const generateNetlist = async (components: ComponentItem[], mainComponentId: string): Promise<Net[]> => {
   const ai = getAI();
   
   const compData = components.map(c => ({
     id: c.id,
     name: c.name,
-    pins: c.pins?.map(p => ({ number: p.pinNumber, name: p.name }))
+    pins: c.pins?.map(p => ({ 
+        number: p.pinNumber, 
+        name: p.name,
+        specs: p.electrical 
+    }))
   }));
 
   const prompt = `
-    Create a professional schematic netlist connecting these components.
+    Create a professional schematic netlist.
     Main Controller ID: ${mainComponentId}
     
-    Components & Available Pins:
+    Components & Detailed Pin Specs:
     ${JSON.stringify(compData, null, 2)}
     
     Rules:
-    - Use EXACT pin numbers/names provided.
-    - Create nets for Power (VCC, 3V3, 5V), Ground (GND), and Data lines.
-    - Assign meaningful net names (e.g., 'I2C_SDA', 'SPI_CLK').
-    - Return a JSON object with a list of nets.
-    - Type should be 'power', 'ground', or 'signal'.
+    - Connect Power Rails based on voltage levels found in pin specs.
+    - Connect Data lines matching protocols (UART to UART, SPI to SPI).
+    - Respect behavior (e.g. connect Pull-ups to Open-Drain pins).
+    - Return JSON nets.
   `;
 
   try {
@@ -342,14 +438,17 @@ export const generateNetlist = async (components: ComponentItem[], mainComponent
 };
 
 // Fallback Pin Analysis (for components without PDF)
-export const analyzePins = async (componentName: string): Promise<PinDefinition[]> => {
+export const analyzePins = async (componentName: string, appContext: string = ""): Promise<PinDefinition[]> => {
   const ai = getAI();
   const prompt = `
     Generate a schematic symbol pinout for: "${componentName}".
-    Assign logical sides for a rectangular schematic symbol:
-    - Left: Inputs, Power In
-    - Right: Outputs, Power Out
-    - Top/Bottom: GND or special control
+    Context: ${appContext}
+    
+    Infer the electrical properties (Voltage, Type) based on common knowledge of this part.
+    Assign logical sides:
+    - Left: Inputs
+    - Right: Outputs
+    - Top/Bottom: Power/GND
   `;
 
   try {
@@ -369,7 +468,14 @@ export const analyzePins = async (componentName: string): Promise<PinDefinition[
                   pinNumber: { type: Type.STRING },
                   name: { type: Type.STRING },
                   type: { type: Type.STRING },
-                  side: { type: Type.STRING, enum: ['left', 'right', 'top', 'bottom'] }
+                  side: { type: Type.STRING, enum: ['left', 'right', 'top', 'bottom'] },
+                  electrical: {
+                    type: Type.OBJECT,
+                    properties: {
+                       maxVoltage: { type: Type.STRING },
+                       behavior: { type: Type.STRING }
+                    }
+                  }
                 }
               }
             }
@@ -382,15 +488,9 @@ export const analyzePins = async (componentName: string): Promise<PinDefinition[
     return json.pins || [];
   } catch (error) {
      return [
-      { pinNumber: "1", name: "VCC", type: "Power", side: "left" },
+      { pinNumber: "1", name: "VCC", type: "Power", side: "top" },
       { pinNumber: "2", name: "GND", type: "Power", side: "bottom" },
       { pinNumber: "3", name: "SIG", type: "IO", side: "right" }
     ];
   }
-};
-
-// 5. Generate Footprint Image (Legacy/Fallback)
-export const generateFootprintImage = async (component: ComponentItem): Promise<string> => {
-    // Kept for backward compatibility if needed, though we focus on CAD view now
-    return "";
 };

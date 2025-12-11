@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
   AppStage, 
@@ -17,7 +16,7 @@ import {
   checkSystemCompatibility,
   searchComponentData
 } from './services/geminiService';
-import { generateKiCadSchematic } from './services/exportService';
+import { generateEagleSchematic } from './services/exportService';
 import { ArchitectureDiagram } from './components/ArchitectureDiagram';
 import { SchematicView } from './components/SchematicView';
 import { 
@@ -40,7 +39,8 @@ import {
   ArrowRight,
   Globe,
   Loader2,
-  Download
+  Download,
+  MousePointer2
 } from 'lucide-react';
 import { INITIAL_LOGS } from './constants';
 
@@ -62,7 +62,10 @@ const App: React.FC = () => {
   const [compatibilityReport, setCompatibilityReport] = useState<CompatibilityReport | null>(null);
   
   // Layout state for Export
-  const [schematicLayout, setSchematicLayout] = useState<Record<string, {x: number, y: number, w: number, h: number}>>({});
+  const [schematicLayout, setSchematicLayout] = useState<{
+      positions: Record<string, {x: number, y: number, w: number, h: number}>,
+      routes: any[]
+  }>({ positions: {}, routes: [] });
 
   const logsEndRef = useRef<HTMLDivElement>(null);
 
@@ -172,27 +175,37 @@ const App: React.FC = () => {
   // --- Export Function ---
   const handleDownloadCAD = () => {
     if (!nets.length || !components.length) return;
-    addLog("Generating KiCad Schematic file...", 'info', 'BUILDER');
+    addLog("Generating Eagle Schematic file (.sch)...", 'info', 'BUILDER');
     
     try {
-      const kicadContent = generateKiCadSchematic({ components, nets }, schematicLayout);
+      // Use the actual layout state from SchematicView
+      const eagleContent = generateEagleSchematic(
+          { components, nets }, 
+          schematicLayout.positions,
+          schematicLayout.routes
+      );
       
       // Trigger Download
-      const blob = new Blob([kicadContent], { type: 'text/plain' });
+      const blob = new Blob([eagleContent], { type: 'text/xml' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `${projectName.replace(/\s+/g, '_')}_Schematic.kicad_sch`;
+      a.download = `${projectName.replace(/\s+/g, '_')}.sch`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
       
-      addLog("KiCad Schematic downloaded. File is compatible with KiCad 6+ and Altium.", 'success', 'BUILDER');
+      addLog("Eagle Schematic (.sch) downloaded. Compatible with Eagle, Altium, KiCad.", 'success', 'BUILDER');
     } catch (e) {
       console.error(e);
       addLog("Failed to generate CAD file.", 'error', 'BUILDER');
     }
+  };
+
+  // --- Layout Handler ---
+  const handleLayoutChange = (positions: any, routes: any) => {
+      setSchematicLayout({ positions, routes });
   };
 
 
@@ -209,17 +222,20 @@ const App: React.FC = () => {
     setComponents(prev => prev.map(c => c.id === comp.id ? { ...c, datasheetFile: file, status: 'analyzing' } : c));
 
     try {
-      addLog(`Analyzing PDF structure with Gemini 3.0 Pro...`, 'info', 'LLM_PRO');
-      const result = await analyzeDatasheetPDF(comp, file);
+      addLog(`Analyzing PDF structure & Electrical Specs with Gemini 3.0 Pro...`, 'info', 'LLM_PRO');
+      // PASS APP DESCRIPTION CONTEXT
+      const result = await analyzeDatasheetPDF(comp, file, appDescription);
       
       setComponents(prev => prev.map(c => c.id === comp.id ? { 
         ...c, 
         pins: result.pins, 
         analysisReport: result.report,
+        physicalSpecs: result.physicalSpecs,
+        isolationRules: result.isolationRules,
         status: 'ready' 
       } : c));
 
-      addLog(`PDF Analysis complete for ${comp.name}. Extracted ${result.pins.length} pins.`, 'success', 'LLM_PRO');
+      addLog(`Deep Analysis complete for ${comp.name}. Extracted physical dimensions & isolation rules.`, 'success', 'LLM_PRO');
 
     } catch (error) {
       addLog(`Failed to analyze PDF for ${comp.name}`, 'error', 'LLM_PRO');
@@ -230,488 +246,333 @@ const App: React.FC = () => {
     if (!mainComponent || !appDescription) return;
     setStage(AppStage.PROCESSING);
     setIsProcessing(true);
-    setLogs([]);
-    
-    // Update project name based on component if it's new
-    if (projectName === "New Project" || projectName === "Untitled Project") {
-      setProjectName(`${mainComponent} Design`);
-    }
+    addLog(`Initializing Design Pipeline for: ${mainComponent}`, 'info', 'CLIENT');
 
     try {
       // 1. Generate BOM
-      addLog("Generating BOM structure...", 'info', 'LLM_FLASH');
-      let currentComponents = await generateBOM(mainComponent, appDescription);
-      setComponents(currentComponents);
-      addLog(`BOM Generated: ${currentComponents.length} components. Starting Auto-Search for Datasheets...`, 'success', 'LLM_FLASH');
+      addLog(`Generating Context-Aware Bill of Materials (BOM)...`, 'info', 'LLM_FLASH');
+      const bom = await generateBOM(mainComponent, appDescription);
+      setComponents(bom);
+      addLog(`BOM Generated with ${bom.length} components.`, 'success', 'LLM_FLASH');
+
+      // 2. Automated Search & Analysis for each Component
+      addLog("Initiating Parallel Datasheet Search & Extraction...", 'info', 'DATASHEET_SPIDER');
       
-      // 2. Auto-Fetch Datasheets Loop
-      for (let i = 0; i < currentComponents.length; i++) {
-        const comp = currentComponents[i];
-        
-        // Update status to 'searching'
-        setComponents(prev => prev.map(c => c.id === comp.id ? { ...c, status: 'searching_datasheet' } : c));
-        
-        addLog(`Searching web for ${comp.name} datasheet & pinout...`, 'info', 'DATASHEET_SPIDER');
-        const searchResult = await searchComponentData(comp.name);
-        
-        if (searchResult.pins && searchResult.pins.length > 0) {
-           addLog(`Found data for ${comp.name}: ${searchResult.pins.length} pins.`, 'success', 'DATASHEET_SPIDER');
-           currentComponents[i] = {
-             ...comp,
-             pins: searchResult.pins,
-             description: searchResult.description || comp.description,
-             datasheetUrl: searchResult.datasheetUrl,
-             status: 'ready'
-           };
-        } else {
-           addLog(`Could not auto-fetch ${comp.name}. Using fallback estimation.`, 'warning', 'DATASHEET_SPIDER');
-           currentComponents[i] = {
-             ...comp,
-             status: 'pending' // Leaves it open for manual upload if user wants, but we will proceed
-           };
-        }
-        
-        // Update state progressively
-        setComponents([...currentComponents]);
+      const updatedComponents = await Promise.all(bom.map(async (comp) => {
+         addLog(`Searching technical data for: ${comp.name}`, 'info', 'DATASHEET_SPIDER');
+         
+         // Use Google Search + Gemini to find pinout and specs
+         const searchResult = await searchComponentData(comp.name, appDescription);
+         
+         if (searchResult.pins.length > 0) {
+             addLog(`Found data for ${comp.name}: ${searchResult.pins.length} pins, ${searchResult.physicalSpecs?.packageType || 'Unknown Package'}`, 'success', 'DATASHEET_SPIDER');
+             return { 
+                 ...comp, 
+                 pins: searchResult.pins, 
+                 status: 'ready', 
+                 datasheetUrl: searchResult.datasheetUrl,
+                 physicalSpecs: searchResult.physicalSpecs,
+                 isolationRules: searchResult.isolationRules 
+             } as ComponentItem;
+         } else {
+             // Fallback
+             addLog(`Deep search failed for ${comp.name}. Using heuristic generation.`, 'warning', 'DATASHEET_SPIDER');
+             const fallbackPins = await analyzePins(comp.name, appDescription);
+             return { ...comp, pins: fallbackPins, status: 'ready' } as ComponentItem;
+         }
+      }));
+
+      setComponents(updatedComponents);
+
+      // 3. Compatibility Check
+      addLog("Running Electrical Rule Check (ERC) & Compatibility Analysis...", 'info', 'LLM_PRO');
+      const report = await checkSystemCompatibility(updatedComponents, appDescription);
+      setCompatibilityReport(report);
+      
+      if (!report.isCompatible) {
+        addLog(`Compatibility Issues Found: ${report.issues.length}`, 'warning', 'LLM_PRO');
+      } else {
+        addLog("System Design Verified. No critical issues.", 'success', 'LLM_PRO');
       }
 
-      addLog("Auto-Fetch Complete. Proceeding to System Compatibility Analysis...", 'info', 'CLIENT');
-      
-      // 3. Trigger Analysis automatically
-      await executeAnalysis(currentComponents);
+      // 4. Generate Netlist
+      addLog("Synthesizing Schematic Netlist...", 'info', 'BUILDER');
+      const mainCompId = updatedComponents[0]?.id;
+      const generatedNets = await generateNetlist(updatedComponents, mainCompId);
+      setNets(generatedNets);
+      addLog(`Netlist created with ${generatedNets.length} distinct nets.`, 'success', 'BUILDER');
 
+      setStage(AppStage.SCHEMATIC);
     } catch (error) {
-      addLog(`Error: ${error}`, 'error', 'CLIENT');
+      console.error(error);
+      addLog("Critical System Failure during processing.", 'error', 'CLIENT');
+    } finally {
       setIsProcessing(false);
     }
   };
 
-  const executeAnalysis = async (currentComponents: ComponentItem[]) => {
-    setCompatibilityReport(null); 
-    addLog("Starting System Compatibility Check with Gemini 3.0 Pro...", 'info', 'LLM_PRO');
 
-    // 1. Fill in missing data (Auto-analyze those without PDFs or Web Data)
-    const updatedComponents = [...currentComponents];
-    for (let i = 0; i < updatedComponents.length; i++) {
-       if (!updatedComponents[i].pins || updatedComponents[i].pins?.length === 0) {
-         addLog(`No pinout for ${updatedComponents[i].name}. Running web-knowledge inference...`, 'warning', 'LLM_FLASH');
-         const pins = await analyzePins(updatedComponents[i].name);
-         updatedComponents[i].pins = pins;
-         updatedComponents[i].status = 'ready';
-       }
-    }
-    setComponents(updatedComponents);
+  // --- UI Renderers ---
 
-    // 2. Compatibility Check
-    const report = await checkSystemCompatibility(updatedComponents);
-    setCompatibilityReport(report);
-
-    if (report.isCompatible) {
-       addLog("System Compatibility Verified. No major issues found.", 'success', 'LLM_PRO');
-       // 3. Generate Schematic only if compatible
-       addLog("Generating Netlist & Schematic Layout...", 'info', 'BUILDER');
-       const netlist = await generateNetlist(updatedComponents, updatedComponents[0].id);
-       setNets(netlist);
-       setStage(AppStage.SCHEMATIC);
-       addLog("CAD Window Ready.", 'success', 'BUILDER');
-    } else {
-       addLog(`Compatibility Issues: ${report.issues.length} found. Review actions required.`, 'warning', 'LLM_PRO');
-       setStage(AppStage.PROCESSING); // Stay on processing/components view
-    }
-
-    setIsProcessing(false);
-  };
-
-  const handleRunAnalysis = async () => {
-    setIsProcessing(true);
-    await executeAnalysis(components);
-  };
-
-  // Iterative Loop: Apply Fixes
-  const applyFixes = () => {
-    if (!compatibilityReport?.actions) return;
-
-    const newComponents = [...components];
-    const newItems: ComponentItem[] = [];
-    
-    compatibilityReport.actions.forEach((action: ComponentAction) => {
-      if (action.type === 'REMOVE') {
-        const idx = newComponents.findIndex(c => c.name.toLowerCase().includes(action.componentName.toLowerCase()));
-        if (idx !== -1) {
-          addLog(`Removing ${action.componentName} per recommendation...`, 'warning', 'CLIENT');
-          newComponents.splice(idx, 1);
-        }
-      } else if (action.type === 'ADD') {
-        // Reuse logic: Check if exists
-        const exists = newComponents.some(c => c.name.toLowerCase() === action.componentName.toLowerCase());
-        if (!exists) {
-          addLog(`Adding ${action.componentName} to component list.`, 'info', 'CLIENT');
-          const newItem: ComponentItem = {
-            id: `comp_auto_${Math.random().toString(36).substr(2, 5)}`,
-            name: action.componentName,
-            description: action.description || "Added by AI Recommendation",
-            footprintType: "Unknown",
-            status: 'pending'
-          };
-          newComponents.push(newItem);
-          newItems.push(newItem);
-        }
-      }
-    });
-
-    setComponents(newComponents);
-    setCompatibilityReport(null); 
-    
-    // Auto-fetch for the new items immediately
-    if (newItems.length > 0) {
-      autoFetchNewItems(newComponents, newItems);
-    } else {
-       addLog("Adjustments made. Please Re-run Analysis.", 'info', 'CLIENT');
-    }
-  };
-
-  const autoFetchNewItems = async (allComponents: ComponentItem[], newItems: ComponentItem[]) => {
-    setIsProcessing(true);
-    addLog(`Auto-fetching data for ${newItems.length} new recommended components...`, 'info', 'DATASHEET_SPIDER');
-    
-    const updatedComponents = [...allComponents];
-
-    for (const newItem of newItems) {
-      const idx = updatedComponents.findIndex(c => c.id === newItem.id);
-      if (idx === -1) continue;
-
-      updatedComponents[idx] = { ...updatedComponents[idx], status: 'searching_datasheet' };
-      setComponents([...updatedComponents]); // Update UI
-
-      const searchResult = await searchComponentData(newItem.name);
-       if (searchResult.pins && searchResult.pins.length > 0) {
-           addLog(`Found data for ${newItem.name}.`, 'success', 'DATASHEET_SPIDER');
-           updatedComponents[idx] = {
-             ...updatedComponents[idx],
-             pins: searchResult.pins,
-             description: searchResult.description || updatedComponents[idx].description,
-             datasheetUrl: searchResult.datasheetUrl,
-             status: 'ready'
-           };
-        } else {
-           updatedComponents[idx].status = 'pending';
-        }
-        setComponents([...updatedComponents]);
-    }
-    
-    setIsProcessing(false);
-    addLog("New components ready. Click 'Run Analysis' to verify.", 'info', 'CLIENT');
-  };
-
-  return (
-    <div className="flex flex-col h-screen bg-eda-bg text-eda-text font-sans overflow-hidden">
-      {/* Header */}
-      <header className="h-16 border-b border-eda-border bg-eda-panel flex items-center justify-between px-6 shrink-0 z-20">
-        <div className="flex items-center gap-3 cursor-pointer" onClick={() => setStage(AppStage.PROJECTS)}>
-          <div className="bg-gradient-to-br from-cyan-500 to-blue-600 p-2 rounded-lg">
-            <Cpu className="text-white" size={24} />
-          </div>
-          <div>
-            <h1 className="font-bold text-lg tracking-tight">AutoSchematic AI</h1>
-            <p className="text-xs text-eda-muted font-mono">Professional Suite</p>
-          </div>
+  const renderProjects = () => (
+    <div className="w-full h-full p-12 overflow-auto">
+      <div className="max-w-6xl mx-auto">
+        <div className="flex justify-between items-center mb-12">
+           <div>
+             <h1 className="text-4xl font-bold text-white mb-2 tracking-tight">AutoSchematic AI</h1>
+             <p className="text-eda-muted text-lg">Next-Gen Generative EDA Suite</p>
+           </div>
+           <button 
+             onClick={createProject}
+             className="bg-eda-accent hover:bg-cyan-400 text-slate-900 px-6 py-3 rounded-lg font-bold flex items-center gap-2 transition-all shadow-lg shadow-cyan-500/20"
+           >
+             <Plus size={20}/> New Project
+           </button>
         </div>
-        
-        {stage !== AppStage.PROJECTS && (
-          <div className="flex items-center gap-2 bg-slate-800/50 px-4 py-2 rounded-lg border border-eda-border">
-             <input 
-               value={projectName} 
-               onChange={(e) => setProjectName(e.target.value)}
-               className="bg-transparent border-none text-sm font-bold text-white focus:outline-none w-48 text-center"
-             />
-          </div>
-        )}
 
-        <div className="flex items-center gap-4">
-           {stage === AppStage.SCHEMATIC && (
-             <button onClick={handleDownloadCAD} className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded text-sm transition-colors shadow-lg">
-               <Download size={14} /> Export KiCad
-             </button>
-           )}
-
-          <button 
-            onClick={() => setStage(AppStage.PROJECTS)} 
-            className={`flex items-center gap-2 px-3 py-1.5 rounded text-sm hover:bg-slate-700 ${stage === AppStage.PROJECTS ? 'bg-cyan-900 text-cyan-200' : 'text-slate-400'}`}
-          >
-            <Folder size={14} /> Projects
-          </button>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {projects.map(p => (
+            <div 
+              key={p.id} 
+              onClick={() => loadProject(p)}
+              className="group bg-eda-panel border border-eda-border p-6 rounded-xl hover:border-eda-accent cursor-pointer transition-all hover:shadow-xl relative"
+            >
+               <div className="flex justify-between items-start mb-4">
+                 <Folder className="text-eda-accent" size={32}/>
+                 <button onClick={(e) => deleteProject(e, p.id)} className="text-eda-muted hover:text-red-400 p-2"><Trash2 size={16}/></button>
+               </div>
+               <h3 className="text-xl font-bold text-white mb-2 group-hover:text-eda-accent transition-colors">{p.name}</h3>
+               <p className="text-eda-muted text-sm line-clamp-2">{p.appDescription}</p>
+               <div className="mt-4 pt-4 border-t border-eda-border flex justify-between text-xs text-eda-muted font-mono">
+                 <span>{p.components.length} Components</span>
+                 <span>{new Date(p.lastModified).toLocaleDateString()}</span>
+               </div>
+            </div>
+          ))}
           
-          {stage !== AppStage.PROJECTS && (
-            <>
-              <div className="h-6 w-[1px] bg-eda-border"></div>
-              <button onClick={() => setStage(AppStage.INPUT)} className={`px-3 py-1.5 rounded text-sm ${stage === AppStage.INPUT ? 'bg-cyan-900 text-cyan-200' : 'text-slate-400'}`}>Input</button>
-              <button onClick={() => setStage(AppStage.ARCH_DIAGRAM)} className={`px-3 py-1.5 rounded text-sm ${stage === AppStage.ARCH_DIAGRAM ? 'bg-cyan-900 text-cyan-200' : 'text-slate-400'}`}>Arch</button>
-            </>
+          {projects.length === 0 && (
+            <div className="col-span-full py-20 text-center text-eda-muted border-2 border-dashed border-eda-border rounded-xl">
+               <p>No projects found. Start a new design.</p>
+            </div>
           )}
         </div>
-      </header>
+      </div>
+    </div>
+  );
 
-      {/* Main Content */}
-      <main className="flex-1 flex overflow-hidden">
+  const renderInputStage = () => (
+    <div className="w-full h-full flex flex-col items-center justify-center p-8 bg-gradient-to-b from-eda-bg to-slate-900">
+      <div className="w-full max-w-2xl bg-eda-panel p-8 rounded-2xl border border-eda-border shadow-2xl">
+        <h2 className="text-3xl font-bold text-white mb-8 flex items-center gap-3">
+          <Cpu className="text-eda-accent" /> Design Parameters
+        </h2>
         
-        {/* --- PROJECTS DASHBOARD VIEW --- */}
-        {stage === AppStage.PROJECTS ? (
-           <div className="w-full h-full overflow-auto bg-slate-900 p-8">
-              <div className="max-w-6xl mx-auto">
-                <div className="flex justify-between items-center mb-8">
-                  <h2 className="text-3xl font-bold text-white tracking-tight">Your Projects</h2>
-                  <button 
-                    onClick={createProject}
-                    className="bg-cyan-600 hover:bg-cyan-500 text-white font-bold py-2 px-4 rounded-lg flex items-center gap-2 shadow-lg transition-all"
-                  >
-                    <Plus size={20} /> Create Project
-                  </button>
+        <div className="space-y-6">
+          <div>
+             <label className="block text-eda-muted text-sm font-bold mb-2 uppercase tracking-wider">Project Name</label>
+             <input 
+               className="w-full bg-eda-bg border border-eda-border rounded-lg p-4 text-white focus:border-eda-accent focus:outline-none transition-colors"
+               value={projectName}
+               onChange={e => setProjectName(e.target.value)}
+               placeholder="e.g., Smart Home Hub v1"
+             />
+          </div>
+
+          <div>
+            <label className="block text-eda-muted text-sm font-bold mb-2 uppercase tracking-wider">Main Component / MCU</label>
+            <input 
+              className="w-full bg-eda-bg border border-eda-border rounded-lg p-4 text-white focus:border-eda-accent focus:outline-none transition-colors font-mono"
+              value={mainComponent}
+              onChange={e => setMainComponent(e.target.value)}
+              placeholder="e.g., ESP32-WROOM-32, STM32F401"
+            />
+          </div>
+          
+          <div>
+            <label className="block text-eda-muted text-sm font-bold mb-2 uppercase tracking-wider">Application Context (Crucial for AI)</label>
+            <textarea 
+              className="w-full bg-eda-bg border border-eda-border rounded-lg p-4 text-white focus:border-eda-accent focus:outline-none transition-colors h-32 resize-none"
+              value={appDescription}
+              onChange={e => setAppDescription(e.target.value)}
+              placeholder="Describe the use case, environment, and required peripherals. E.g., 'Automotive sensor node reading 12V signals, needs CAN bus, reverse polarity protection, and robust 5V regulation.'"
+            />
+          </div>
+
+          <div className="pt-4 flex gap-4">
+             <button onClick={() => setStage(AppStage.PROJECTS)} className="px-6 py-4 rounded-lg font-bold text-eda-muted hover:text-white transition-colors">Back</button>
+             <button 
+                className="flex-1 bg-eda-accent hover:bg-cyan-400 text-slate-900 py-4 rounded-lg font-bold text-lg flex items-center justify-center gap-2 transition-all shadow-[0_0_20px_rgba(6,182,212,0.3)]"
+                onClick={handleStartProcessing}
+             >
+                <Play size={20} fill="currentColor" /> Generate Schematic
+             </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  const renderProcessingStage = () => (
+    <div className="w-full h-full flex flex-col">
+       <div className="h-1/2 border-b border-eda-border bg-eda-bg relative">
+          <ArchitectureDiagram />
+          {/* Overlay Status */}
+          <div className="absolute bottom-8 left-1/2 -translate-x-1/2 bg-eda-panel/90 backdrop-blur border border-eda-accent/30 px-6 py-3 rounded-full flex items-center gap-3 shadow-xl">
+             <Loader2 className="animate-spin text-eda-accent" size={20}/>
+             <span className="text-eda-accent font-mono text-sm">
+               {components.length === 0 ? "Analyzing Architecture..." : 
+                nets.length === 0 ? `Processing Components (${components.filter(c => c.status === 'ready').length}/${components.length})...` :
+                "Finalizing Netlist..."}
+             </span>
+          </div>
+       </div>
+       <div className="h-1/2 bg-black p-4 font-mono text-xs overflow-auto">
+          {logs.map((log, i) => (
+            <div key={i} className={`mb-1 flex gap-3 ${log.type === 'error' ? 'text-red-400' : log.type === 'success' ? 'text-green-400' : log.type === 'warning' ? 'text-yellow-400' : 'text-slate-400'}`}>
+               <span className="opacity-50 min-w-[80px]">{new Date(log.timestamp).toLocaleTimeString()}</span>
+               <span className={`font-bold px-2 py-0.5 rounded text-[10px] bg-white/5 w-[120px] text-center shrink-0 ${
+                   log.system === 'LLM_PRO' ? 'text-purple-400' : 
+                   log.system === 'DATASHEET_SPIDER' ? 'text-orange-400' : 
+                   'text-blue-400'
+               }`}>
+                 {log.system}
+               </span>
+               <span>{log.message}</span>
+            </div>
+          ))}
+          <div ref={logsEndRef} />
+       </div>
+    </div>
+  );
+
+  const renderSchematicStage = () => (
+    <div className="w-full h-full flex bg-eda-bg text-eda-text overflow-hidden">
+      {/* Sidebar: Components */}
+      <div className="w-80 flex-shrink-0 border-r border-eda-border bg-eda-panel flex flex-col">
+        <div className="p-4 border-b border-eda-border bg-eda-bg/50 backdrop-blur">
+          <div className="flex justify-between items-center mb-1">
+             <h2 className="font-bold text-white flex items-center gap-2"><Layers size={18} className="text-eda-accent"/> Components</h2>
+             <button onClick={saveProject} className="text-eda-muted hover:text-white" title="Save Project"><Save size={18}/></button>
+          </div>
+          <div className="text-xs text-eda-muted flex items-center gap-2">
+             <span className={`w-2 h-2 rounded-full ${compatibilityReport?.isCompatible ? 'bg-green-500' : 'bg-red-500'}`}></span>
+             {compatibilityReport?.isCompatible ? "Design Valid" : "Issues Found"}
+          </div>
+        </div>
+        
+        <div className="flex-1 overflow-y-auto p-2 space-y-2">
+          {components.map(c => (
+             <div 
+               key={c.id} 
+               onClick={() => setSelectedComponent(c)}
+               className={`p-3 rounded border transition-all cursor-pointer ${selectedComponent?.id === c.id ? 'bg-eda-accent/10 border-eda-accent' : 'bg-eda-bg border-eda-border hover:border-slate-500'}`}
+             >
+                <div className="flex justify-between items-start mb-1">
+                   <span className="font-bold text-sm text-white">{c.name}</span>
+                   {c.status === 'ready' ? <CheckCircle size={14} className="text-green-500"/> : <Loader2 size={14} className="animate-spin text-eda-accent"/>}
                 </div>
-
-                {projects.length === 0 ? (
-                  <div className="text-center py-20 border-2 border-dashed border-slate-700 rounded-xl">
-                    <Folder size={48} className="mx-auto text-slate-600 mb-4" />
-                    <p className="text-slate-400 text-lg">No projects yet. Start building something amazing.</p>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                    {projects.map((p) => (
-                      <div key={p.id} className="bg-eda-panel border border-eda-border rounded-xl p-6 hover:border-cyan-500 transition-all cursor-pointer group shadow-lg relative" onClick={() => loadProject(p)}>
-                        <div className="absolute top-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity">
-                           <button onClick={(e) => deleteProject(e, p.id)} className="p-2 hover:bg-red-900/30 text-red-400 rounded-full"><Trash2 size={16}/></button>
-                        </div>
-                        <h3 className="text-xl font-bold text-cyan-100 mb-1">{p.name}</h3>
-                        <p className="text-xs text-slate-500 font-mono mb-4">Last edited: {new Date(p.lastModified).toLocaleDateString()}</p>
-                        
-                        <div className="space-y-2 mb-6">
-                           <div className="flex items-center gap-2 text-sm text-slate-300">
-                              <Cpu size={14} className="text-cyan-500"/>
-                              <span>{p.mainComponent}</span>
-                           </div>
-                           <div className="flex items-center gap-2 text-sm text-slate-300">
-                              <Layers size={14} className="text-purple-500"/>
-                              <span>{p.components.length} Components</span>
-                           </div>
-                           {p.compatibilityReport && (
-                              <div className="flex items-center gap-2 text-sm">
-                                 {p.compatibilityReport.isCompatible 
-                                   ? <span className="text-green-400 flex gap-1 items-center"><CheckCircle size={14}/> Verified</span>
-                                   : <span className="text-yellow-400 flex gap-1 items-center"><AlertTriangle size={14}/> Issues Found</span>
-                                 }
-                              </div>
-                           )}
-                        </div>
-
-                        <div className="flex items-center text-cyan-400 text-sm font-bold group-hover:translate-x-1 transition-transform">
-                          Open Project <ArrowRight size={16} className="ml-1"/>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-           </div>
-        ) : (
-          <>
-            {/* Sidebar (Editor Mode) */}
-            <aside className="w-96 border-r border-eda-border bg-eda-panel/50 flex flex-col shrink-0">
-              <div className="p-4 border-b border-eda-border">
-                 <button 
-                   onClick={saveProject}
-                   className="w-full bg-slate-700 hover:bg-slate-600 text-slate-200 py-2 rounded flex items-center justify-center gap-2 text-sm font-medium transition-colors"
-                 >
-                   <Save size={16} /> Save Project
-                 </button>
-              </div>
-
-              <div className="flex-1 overflow-auto p-4">
-                <h3 className="text-xs font-bold text-eda-muted uppercase mb-4 flex items-center gap-2">
-                  <Layers size={14} /> Design Components
-                </h3>
+                <p className="text-xs text-eda-muted line-clamp-1 mb-2">{c.description}</p>
                 
-                <div className="space-y-3">
-                  {components.map(c => (
-                    <div 
-                      key={c.id} 
-                      className={`p-3 rounded-lg border text-sm transition-all relative group ${selectedComponent?.id === c.id ? 'border-cyan-500 bg-cyan-900/10' : 'border-eda-border bg-slate-800/50'}`}
-                      onClick={() => setSelectedComponent(c)}
-                    >
-                      <div className="flex justify-between items-start mb-2">
-                        <span className="font-mono font-bold text-cyan-300">{c.name}</span>
-                        <div className="flex items-center gap-2">
-                           {c.status === 'searching_datasheet' && <Loader2 size={14} className="animate-spin text-cyan-500"/>}
-                           {c.status === 'ready' && <CheckCircle size={14} className="text-green-500"/>}
-                           {(c.datasheetFile) && <FileText size={14} className="text-blue-400"/>}
-                           {(c.datasheetUrl && !c.datasheetFile) && <Globe size={14} className="text-blue-400"/>}
-                        </div>
-                      </div>
-                      <p className="text-xs text-slate-400 mb-3 line-clamp-2">{c.description}</p>
-                      
-                      {/* Upload / Link Display */}
-                      <div className="flex gap-2">
-                         {c.datasheetUrl && !c.datasheetUrl.startsWith('data:') ? (
-                            <a href={c.datasheetUrl} target="_blank" rel="noopener noreferrer" className="flex-1 flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-600 text-cyan-400 py-1.5 px-3 rounded text-xs transition-colors">
-                               <Globe size={12} /> View Datasheet Source
-                            </a>
-                         ) : (
-                            <label className="flex-1 flex items-center justify-center gap-2 bg-slate-700 hover:bg-slate-600 text-slate-200 py-1.5 px-3 rounded cursor-pointer text-xs transition-colors">
-                              <Upload size={12} />
-                              {c.datasheetFile ? 'Update PDF' : 'Upload Manual PDF'}
-                              <input 
-                                type="file" 
-                                accept=".pdf" 
-                                className="hidden" 
-                                onChange={(e) => handleFileUpload(e, c)}
-                              />
-                            </label>
-                         )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                {components.length > 0 && (stage === AppStage.PROCESSING || stage === AppStage.SCHEMATIC || stage === AppStage.INPUT) && (
-                  <div className="mt-6 flex flex-col gap-2">
-                    {/* Run / Re-run Button */}
-                    <button 
-                      onClick={handleRunAnalysis}
-                      disabled={isProcessing}
-                      className={`w-full font-bold py-3 rounded-lg flex items-center justify-center gap-2 shadow-lg transition-all
-                        ${isProcessing ? 'bg-slate-600 cursor-not-allowed' : 'bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white'}
-                      `}
-                    >
-                      {isProcessing ? <Activity className="animate-spin" /> : <RefreshCw size={18} />}
-                      {stage === AppStage.SCHEMATIC ? 'Re-run Analysis' : 'Run System Analysis'}
-                    </button>
-                    {stage === AppStage.SCHEMATIC && <p className="text-center text-[10px] text-slate-500">Run again if you modified components.</p>}
-                  </div>
+                {/* PDF Upload / Status */}
+                {c.datasheetUrl ? (
+                   <a href={c.datasheetUrl} target="_blank" rel="noreferrer" className="text-[10px] flex items-center gap-1 text-cyan-400 hover:underline" onClick={e => e.stopPropagation()}>
+                      <Globe size={10}/> Datasheet
+                   </a>
+                ) : (
+                   <label className="text-[10px] flex items-center gap-1 text-eda-muted hover:text-white cursor-pointer bg-white/5 p-1 rounded justify-center">
+                      <Upload size={10}/> Upload PDF
+                      <input type="file" className="hidden" accept=".pdf" onChange={(e) => handleFileUpload(e, c)} />
+                   </label>
                 )}
-              </div>
+             </div>
+          ))}
+        </div>
 
-              {/* Logs */}
-              <div className="h-48 border-t border-eda-border bg-black p-3 flex flex-col font-mono text-[10px]">
-                <div className="flex-1 overflow-y-auto space-y-1 pr-2">
-                  {logs.map((log, i) => (
-                    <div key={i} className="flex gap-2">
-                      <span className="text-slate-600 shrink-0">[{new Date(log.timestamp).toLocaleTimeString([], {hour12: false, minute:'2-digit', second:'2-digit'})}]</span>
-                      <span className={`${log.type === 'error' ? 'text-red-500' : log.type === 'success' ? 'text-green-400' : log.type === 'warning' ? 'text-yellow-400' : 'text-slate-300'}`}>
-                        {log.message}
-                      </span>
-                    </div>
-                  ))}
-                  <div ref={logsEndRef} />
-                </div>
-              </div>
-            </aside>
-
-            {/* Right Content */}
-            <section className="flex-1 relative bg-slate-100 overflow-hidden flex flex-col">
-              
-              {/* Input Stage */}
-              {stage === AppStage.INPUT && (
-                <div className="flex-1 flex flex-col items-center justify-center bg-eda-bg p-8">
-                  <div className="max-w-2xl w-full bg-eda-panel border border-eda-border rounded-xl p-8 shadow-2xl">
-                    <div className="flex items-center gap-3 mb-6">
-                      <div className="p-3 rounded-full bg-cyan-500/20 text-cyan-400"><PenTool size={24} /></div>
-                      <h2 className="text-2xl font-bold text-white">Project Setup</h2>
-                    </div>
-                    <div className="space-y-6">
-                      <div>
-                        <label className="block text-sm font-medium text-slate-400 mb-2">Main Controller</label>
-                        <input type="text" value={mainComponent} onChange={(e) => setMainComponent(e.target.value)} className="w-full bg-eda-bg border border-eda-border rounded-lg px-4 py-3 text-white focus:ring-2 focus:ring-cyan-500 outline-none" placeholder="e.g., STM32F4" />
-                      </div>
-                      <div>
-                        <label className="block text-sm font-medium text-slate-400 mb-2">Application Goal</label>
-                        <textarea value={appDescription} onChange={(e) => setAppDescription(e.target.value)} className="w-full bg-eda-bg border border-eda-border rounded-lg px-4 py-3 text-white focus:ring-2 focus:ring-cyan-500 outline-none h-32 resize-none" />
-                      </div>
-                      <button onClick={handleStartProcessing} disabled={isProcessing} className="w-full bg-cyan-600 hover:bg-cyan-500 disabled:bg-slate-600 disabled:cursor-not-allowed text-white font-bold py-4 rounded-lg flex items-center justify-center gap-2">
-                        {isProcessing ? <Loader2 size={20} className="animate-spin" /> : <Play size={20} fill="currentColor" />} 
-                        {isProcessing ? 'Initializing...' : 'Initialize Design'}
-                      </button>
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* Architecture Stage */}
-              {stage === AppStage.ARCH_DIAGRAM && <ArchitectureDiagram />}
-
-              {/* Schematic Stage */}
-              {(stage === AppStage.PROCESSING || stage === AppStage.SCHEMATIC) && (
-                <div className="flex-1 h-full relative">
-                    {/* Render Schematic if we have nets, otherwise just components placeholder */}
-                    {(stage === AppStage.SCHEMATIC && nets.length > 0) ? (
-                      <SchematicView 
-                        data={{ components, nets }} 
-                        onLayoutChange={setSchematicLayout}
-                      />
-                    ) : (
-                      <div className="w-full h-full flex flex-col items-center justify-center text-slate-400 bg-white">
-                        <Activity size={48} className={`mb-4 ${isProcessing ? 'animate-spin text-cyan-500' : 'text-slate-300'}`} />
-                        <p className="text-lg font-medium">{isProcessing ? 'Analyzing System & Fetching Datasheets...' : 'Ready to Analyze'}</p>
-                        <p className="text-sm mt-2 text-slate-500">
-                          {isProcessing ? "AI is searching the web for component specifications." : "Upload datasheets for best results."}
-                        </p>
-                      </div>
-                    )}
-
-                    {/* Compatibility Overlay */}
-                    {compatibilityReport && (
-                      <div className="absolute top-4 right-4 max-w-sm w-full bg-white/95 backdrop-blur shadow-xl border border-slate-200 rounded-lg p-4 animate-slideIn max-h-[80vh] overflow-auto z-10">
-                        <h4 className={`font-bold text-sm mb-2 flex items-center gap-2 ${compatibilityReport.isCompatible ? 'text-green-600' : 'text-red-600'}`}>
-                          {compatibilityReport.isCompatible ? <CheckCircle size={16}/> : <AlertTriangle size={16}/>}
-                          {compatibilityReport.isCompatible ? 'System Verified' : 'Attention Needed'}
-                        </h4>
-                        
-                        {!compatibilityReport.isCompatible && (
-                          <>
-                            <div className="space-y-2 mb-3">
-                              {compatibilityReport.issues.map((issue, i) => (
-                                <div key={i} className="text-xs text-red-700 bg-red-50 p-2 rounded border border-red-100">{issue}</div>
-                              ))}
-                            </div>
-                            
-                            {compatibilityReport.actions && compatibilityReport.actions.length > 0 && (
-                              <div className="mb-4">
-                                <p className="text-[10px] font-bold text-slate-500 uppercase mb-2">Recommended Actions</p>
-                                <div className="space-y-2">
-                                  {compatibilityReport.actions.map((action, i) => (
-                                    <div key={i} className="flex items-start gap-2 text-xs bg-slate-50 p-2 rounded border border-slate-200">
-                                      <div className={`mt-0.5 w-4 h-4 rounded flex items-center justify-center shrink-0 ${action.type === 'ADD' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
-                                        {action.type === 'ADD' ? '+' : '-'}
-                                      </div>
-                                      <div>
-                                        <span className="font-bold">{action.type} {action.componentName}</span>
-                                        <p className="text-slate-500 leading-tight mt-0.5">{action.reason}</p>
-                                      </div>
-                                    </div>
-                                  ))}
-                                </div>
-                                <button 
-                                  onClick={applyFixes}
-                                  className="mt-3 w-full bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold py-2 rounded flex items-center justify-center gap-2"
-                                >
-                                  <Wrench size={12} /> Apply AI Recommendations
-                                </button>
-                              </div>
-                            )}
-                          </>
-                        )}
-
-                        <div className="space-y-1">
-                          <p className="text-[10px] font-bold text-slate-500 uppercase">Analysis Notes</p>
-                          {compatibilityReport.recommendations.map((rec, i) => (
-                              <div key={i} className="text-xs text-slate-600">• {rec}</div>
-                            ))}
-                        </div>
-                      </div>
-                    )}
-                </div>
-              )}
-            </section>
-          </>
+        {/* Compatibility Report Mini-View */}
+        {compatibilityReport && !compatibilityReport.isCompatible && (
+           <div className="p-4 bg-red-900/20 border-t border-red-900/50">
+              <h3 className="text-red-400 font-bold text-xs mb-2 flex items-center gap-2"><AlertTriangle size={12}/> Design Issues</h3>
+              <ul className="text-[10px] text-red-200 list-disc pl-4 space-y-1">
+                 {compatibilityReport.issues.slice(0, 3).map((issue, i) => <li key={i}>{issue}</li>)}
+              </ul>
+           </div>
         )}
-      </main>
+      </div>
+
+      {/* Main Schematic Canvas */}
+      <div className="flex-1 flex flex-col relative">
+         <SchematicView 
+            data={{ components, nets }} 
+            onLayoutChange={handleLayoutChange} 
+         />
+      </div>
+
+      {/* Right Sidebar: Details */}
+      <div className="w-80 flex-shrink-0 border-l border-eda-border bg-eda-panel flex flex-col">
+          {selectedComponent ? (
+            <div className="p-0 flex flex-col h-full">
+               <div className="p-4 border-b border-eda-border bg-eda-bg">
+                  <h2 className="font-bold text-lg text-white mb-1">{selectedComponent.name}</h2>
+                  <span className="text-xs font-mono text-eda-accent bg-eda-accent/10 px-2 py-0.5 rounded">{selectedComponent.footprintType}</span>
+               </div>
+               
+               <div className="p-4 flex-1 overflow-y-auto">
+                  <div className="mb-6">
+                     <h3 className="text-xs font-bold text-eda-muted uppercase mb-2">Technical Specs</h3>
+                     <div className="bg-eda-bg rounded p-3 text-xs font-mono text-slate-300 space-y-1">
+                        <div className="flex justify-between"><span>Width:</span> <span className="text-white">{selectedComponent.physicalSpecs?.widthMm || '?'} mm</span></div>
+                        <div className="flex justify-between"><span>Pitch:</span> <span className="text-white">{selectedComponent.physicalSpecs?.pinPitchMm || '?'} mm</span></div>
+                        <div className="flex justify-between"><span>Pins:</span> <span className="text-white">{selectedComponent.pins?.length || 0}</span></div>
+                     </div>
+                  </div>
+
+                  {selectedComponent.isolationRules && selectedComponent.isolationRules.length > 0 && (
+                      <div className="mb-6">
+                        <h3 className="text-xs font-bold text-orange-400 uppercase mb-2 flex items-center gap-2"><AlertTriangle size={12}/> Isolation Rules</h3>
+                        <ul className="list-disc pl-4 text-xs text-orange-200/80 space-y-1">
+                           {selectedComponent.isolationRules.map((rule, i) => <li key={i}>{rule}</li>)}
+                        </ul>
+                      </div>
+                  )}
+
+                  <div className="mb-6">
+                     <h3 className="text-xs font-bold text-eda-muted uppercase mb-2">Pin Configuration</h3>
+                     <div className="space-y-1">
+                        {selectedComponent.pins?.map((pin, i) => (
+                           <div key={i} className="flex items-center text-xs bg-eda-bg/50 p-1.5 rounded border border-transparent hover:border-eda-border">
+                              <span className="font-mono text-eda-accent w-6 mr-2 text-right">{pin.pinNumber}</span>
+                              <span className="text-white font-bold mr-auto">{pin.name}</span>
+                              <span className="text-[10px] text-eda-muted bg-white/5 px-1.5 rounded">{pin.type}</span>
+                              {pin.electrical?.behavior && <span className="ml-1 text-[9px] text-yellow-500" title={pin.electrical.behavior}>⚡</span>}
+                           </div>
+                        ))}
+                     </div>
+                  </div>
+               </div>
+            </div>
+          ) : (
+            <div className="flex-1 flex flex-col items-center justify-center text-eda-muted p-8 text-center">
+               <MousePointer2 size={48} className="mb-4 opacity-20"/>
+               <p>Select a component to view deep technical analysis and physical specs.</p>
+            </div>
+          )}
+          
+          <div className="p-4 border-t border-eda-border bg-eda-bg">
+             <button onClick={handleDownloadCAD} className="w-full bg-eda-accent hover:bg-cyan-400 text-slate-900 font-bold py-3 rounded flex items-center justify-center gap-2 transition-all">
+                <Download size={18}/> Export .SCH
+             </button>
+             <p className="text-[10px] text-center mt-2 text-eda-muted">Compatible with Eagle, Altium, KiCad</p>
+          </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="w-screen h-screen bg-eda-bg text-eda-text font-sans overflow-hidden">
+      {stage === AppStage.PROJECTS && renderProjects()}
+      {stage === AppStage.INPUT && renderInputStage()}
+      {stage === AppStage.PROCESSING && renderProcessingStage()}
+      {stage === AppStage.SCHEMATIC && renderSchematicStage()}
     </div>
   );
 };

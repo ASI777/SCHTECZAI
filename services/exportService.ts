@@ -1,186 +1,225 @@
-
 import { SchematicData, ComponentItem, PinDefinition, Net } from '../types';
 
-// Generate a unique UUID for KiCad objects
-const generateUUID = () => {
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-    var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
-    return v.toString(16);
-  });
-};
+interface Route {
+  path: {x: number, y: number}[];
+  color: string;
+  id: string;
+  netName: string;
+}
+
+// Eagle uses 0.1 inch grid standard (2.54mm).
+// Web uses 20px grid.
+// Scale factor: 20px -> 2.54mm
+const SCALE = 2.54 / 20;
+
+const cleanName = (name: string) => name.replace(/[^a-zA-Z0-9_-]/g, '_');
 
 /**
- * Generates a KiCad 6.0+ Schematic File (.kicad_sch)
- * Compatible with KiCad 6, 7, 8 and importable by Altium Designer.
+ * Generates an Eagle CAD XML Schematic File (.sch)
+ * Compatible with Eagle 9.x, Fusion 360, Altium Designer (Import), and KiCad (Import).
  */
-export const generateKiCadSchematic = (data: SchematicData, layoutPositions: Record<string, {x: number, y: number, w: number, h: number}>): string => {
-  // Header
-  let content = `(kicad_sch (version 20211014) (generator "AutoSchematicAI")\n`;
-  content += `  (paper "A2")\n`;
-  content += `  (lib_symbols\n`;
+export const generateEagleSchematic = (
+    data: SchematicData, 
+    layoutPositions: Record<string, {x: number, y: number, w: number, h: number}>,
+    routes: Route[] = []
+): string => {
 
-  // --- 1. Define Symbols Dynamically ---
+  const timestamp = new Date().toISOString();
+  let xml = `<?xml version="1.0" encoding="utf-8"?>\n`;
+  xml += `<!DOCTYPE eagle SYSTEM "eagle.dtd">\n`;
+  xml += `<eagle version="9.6.2">\n`;
+  xml += `<drawing>\n`;
+  xml += `<settings>\n<setting alwaysvectorfont="no"/>\n<setting verticaltext="up"/>\n</settings>\n`;
+  xml += `<grid distance="0.1" unitdist="inch" unit="inch" style="lines" multiple="1" display="no" altdistance="0.01" altunitdist="inch" altunit="inch"/>\n`;
+  
+  // Layers
+  xml += `<layers>\n`;
+  xml += `<layer number="91" name="Nets" color="2" fill="1" visible="yes" active="yes"/>\n`;
+  xml += `<layer number="92" name="Busses" color="1" fill="1" visible="yes" active="yes"/>\n`;
+  xml += `<layer number="93" name="Pins" color="2" fill="1" visible="yes" active="yes"/>\n`;
+  xml += `<layer number="94" name="Symbols" color="4" fill="1" visible="yes" active="yes"/>\n`;
+  xml += `<layer number="95" name="Names" color="7" fill="1" visible="yes" active="yes"/>\n`;
+  xml += `<layer number="96" name="Values" color="7" fill="1" visible="yes" active="yes"/>\n`;
+  xml += `</layers>\n`;
+
+  // Schematic
+  xml += `<schematic xreflabel="%F%N/%S.%C%R" xrefpart="/%S.%C%R">\n`;
+  
+  // --- LIBRARIES ---
+  xml += `<libraries>\n`;
+  xml += `<library name="AutoSchematicLib">\n`;
+  xml += `<packages>\n</packages>\n`;
+  xml += `<symbols>\n`;
+
+  // Generate Symbols for each component
   data.components.forEach(comp => {
-    // Sanitize name
-    const safeName = comp.name.replace(/[^a-zA-Z0-9_]/g, "_");
-    
-    // Determine Dimensions based on layout or pin count
-    // KiCad units: 1.27mm = 50mil. We map our 20px grid to 50mil (1.27mm) or 100mil (2.54mm).
-    // Let's assume 100mil (2.54mm) grid for standard schematic.
-    
-    const pos = layoutPositions[comp.id];
-    const width = pos ? pos.w / 10 : 20; // Scale down pixels to KiCad units roughly
-    const height = pos ? pos.h / 10 : 20;
-    
-    const halfW = width / 2 * 2.54; // Convert to mm
-    const halfH = height / 2 * 2.54;
+      const symName = cleanName(comp.name);
+      const pos = layoutPositions[comp.id] || { x:0, y:0, w: 100, h: 100 };
+      
+      // Dimensions in mm
+      const w = pos.w * SCALE;
+      const h = pos.h * SCALE;
+      const halfW = w / 2;
+      const halfH = h / 2;
 
-    content += `    (symbol "${safeName}" (in_bom yes) (on_board yes)\n`;
-    content += `      (property "Reference" "U" (id 0) (at 0 -${(halfH + 2.54).toFixed(2)} 0) (effects (font (size 1.27 1.27))))\n`;
-    content += `      (property "Value" "${comp.name}" (id 1) (at 0 ${(halfH + 2.54).toFixed(2)} 0) (effects (font (size 1.27 1.27))))\n`;
-    content += `      (property "Footprint" "" (id 2) (at 0 0 0) (effects (font (size 1.27 1.27)) hide))\n`;
-    
-    // Draw Body Rectangle
-    content += `      (symbol "${safeName}_0_1"\n`;
-    content += `        (rectangle (start -${halfW.toFixed(2)} -${halfH.toFixed(2)}) (end ${halfW.toFixed(2)} ${halfH.toFixed(2)}) (stroke (width 0.254) (type default) (fill (type background))))\n`;
-    content += `      )\n`;
+      xml += `<symbol name="${symName}">\n`;
+      
+      // Box
+      // Eagle Y is up. To match web appearance where Y is down, we draw relative to 0,0 center.
+      xml += `<wire x1="-${halfW}" y1="${halfH}" x2="${halfW}" y2="${halfH}" width="0.254" layer="94"/>\n`;
+      xml += `<wire x1="${halfW}" y1="${halfH}" x2="${halfW}" y2="-${halfH}" width="0.254" layer="94"/>\n`;
+      xml += `<wire x1="${halfW}" y1="-${halfH}" x2="-${halfW}" y2="-${halfH}" width="0.254" layer="94"/>\n`;
+      xml += `<wire x1="-${halfW}" y1="-${halfH}" x2="-${halfW}" y2="${halfH}" width="0.254" layer="94"/>\n`;
 
-    // Draw Pins
-    (comp.pins || []).forEach((pin, idx) => {
-        // We need to match the logic from SchematicView to place pins correctly in the symbol definition
-        // This is tricky because SchematicView calculates positions dynamically.
-        // We will approximate: 
-        // Left pins: x = -halfW
-        // Right pins: x = +halfW
-        // Top/Bottom distributed
-        
+      // Text
+      xml += `<text x="-${halfW}" y="${halfH + 1}" size="1.778" layer="95">&gt;NAME</text>\n`;
+      xml += `<text x="-${halfW}" y="-${halfH + 3}" size="1.778" layer="96">&gt;VALUE</text>\n`;
+
+      // Pins
+      (comp.pins || []).forEach(pin => {
         const leftPins = comp.pins?.filter(p => p.side === 'left' || !p.side) || [];
         const rightPins = comp.pins?.filter(p => p.side === 'right') || [];
         const topPins = comp.pins?.filter(p => p.side === 'top') || [];
         const bottomPins = comp.pins?.filter(p => p.side === 'bottom') || [];
 
-        let x = 0, y = 0, angle = 0;
+        let x = 0, y = 0, rot = "R0";
         
-        const pinSpacing = 2.54; // 100 mil
-        
+        // In Web: Y is from top (0) to bottom (pos.h). 
+        // In Eagle: Y is from bottom (-halfH) to top (halfH) ? No, we need to invert.
+        // Let's map Web Y (0 to h) to Eagle Y (halfH to -halfH).
+        // formula: eagleY = halfH - (webY * SCALE)
+
         if (leftPins.includes(pin)) {
-            const i = leftPins.indexOf(pin);
-            x = -halfW - 2.54; 
-            y = -halfH + pinSpacing + (i * pinSpacing * 2); // Spread out
-            angle = 0;
-        } else if (rightPins.includes(pin)) {
-            const i = rightPins.indexOf(pin);
-            x = halfW + 2.54;
-            y = -halfH + pinSpacing + (i * pinSpacing * 2);
-            angle = 180;
-        } else if (topPins.includes(pin)) {
-            const i = topPins.indexOf(pin);
-            const step = (halfW * 2) / (topPins.length + 1);
-            x = -halfW + (step * (i + 1));
-            y = -halfH - 2.54;
-            angle = 270;
-        } else if (bottomPins.includes(pin)) {
-            const i = bottomPins.indexOf(pin);
-            const step = (halfW * 2) / (bottomPins.length + 1);
-            x = -halfW + (step * (i + 1));
-            y = halfH + 2.54;
-            angle = 90;
+            const idx = leftPins.indexOf(pin);
+            // Web Logic: HEADER_HEIGHT + PIN_SPACING + (idx * PIN_SPACING * 2)
+            // Hardcoded from SchematicView: 40 + 20 + idx*40
+            const webY = 60 + (idx * 40);
+            
+            // Left Pin: Connection point at -halfW, line draws LEFT (away from box) -> R180
+            x = -halfW;
+            y = halfH - (webY * SCALE);
+            rot = "R180"; 
+        } 
+        else if (rightPins.includes(pin)) {
+            const idx = rightPins.indexOf(pin);
+            const webY = 60 + (idx * 40);
+            
+            // Right Pin: Connection point at halfW, line draws RIGHT (away from box) -> R0
+            x = halfW;
+            y = halfH - (webY * SCALE);
+            rot = "R0"; 
+        }
+        else if (topPins.includes(pin)) {
+            const idx = topPins.indexOf(pin);
+            const step = pos.w / (topPins.length + 1);
+            const webX = step * (idx + 1);
+            
+            // Top Pin: Connection point at top, line draws UP -> R90
+            x = -halfW + (webX * SCALE);
+            y = halfH;
+            rot = "R90"; 
+        }
+        else if (bottomPins.includes(pin)) {
+            const idx = bottomPins.indexOf(pin);
+            const step = pos.w / (bottomPins.length + 1);
+            const webX = step * (idx + 1);
+            
+            // Bottom Pin: Connection point at bottom, line draws DOWN -> R270
+            x = -halfW + (webX * SCALE);
+            y = -halfH;
+            rot = "R270"; 
         }
 
-        content += `      (symbol "${safeName}_1_1"\n`;
-        content += `        (pin input line (at ${x.toFixed(2)} ${y.toFixed(2)} ${angle}) (length 2.54)\n`;
-        content += `          (name "${pin.name}" (effects (font (size 1.27 1.27))))\n`;
-        content += `          (number "${pin.pinNumber}" (effects (font (size 1.27 1.27))))\n`;
-        content += `        )\n`;
-        content += `      )\n`;
-    });
-
-    content += `    )\n`;
-  });
-  content += `  )\n`; // End lib_symbols
-
-  // --- 2. Place Component Instances ---
-  data.components.forEach((comp, idx) => {
-      const pos = layoutPositions[comp.id];
-      if (!pos) return;
-      const safeName = comp.name.replace(/[^a-zA-Z0-9_]/g, "_");
-      
-      // Map pixels to mm (approx)
-      // 20px = 2.54mm grid
-      const ratio = 2.54 / 20;
-      const atX = (pos.x + pos.w / 2) * ratio;
-      const atY = (pos.y + pos.h / 2) * ratio;
-
-      content += `  (symbol (lib_id "${safeName}") (at ${atX.toFixed(2)} ${atY.toFixed(2)} 0) (unit 1)\n`;
-      content += `    (in_bom yes) (on_board yes) (uuid "${generateUUID()}")\n`;
-      content += `    (property "Reference" "U${idx+1}" (id 0) (at ${atX.toFixed(2)} ${(atY - 5).toFixed(2)} 0))\n`;
-      content += `    (property "Value" "${comp.name}" (id 1) (at ${atX.toFixed(2)} ${(atY + 5).toFixed(2)} 0))\n`;
-      content += `  )\n`;
-  });
-
-  // --- 3. Connectivity (Net Labels) ---
-  // To ensure robust connectivity without calculating complex wire geometry for export,
-  // we place Global Labels on every connected pin. This is standard auto-generated schematic practice.
-  
-  data.nets.forEach(net => {
-      const netName = net.name.toUpperCase().replace(/\s+/g, "_");
-      
-      net.connections.forEach(conn => {
-          const comp = data.components.find(c => c.id === conn.componentId);
-          if (!comp) return;
-          const pos = layoutPositions[comp.id];
-          if (!pos) return;
-          
-          // Re-calculate absolute pin position to place label
-          // Must match Symbol Def + Instance Position logic
-          const ratio = 2.54 / 20; // px to mm
-          
-          const width = pos.w * ratio;
-          const height = pos.h * ratio;
-          const halfW = width / 2;
-          const halfH = height / 2;
-          const centerX = (pos.x + pos.w / 2) * ratio;
-          const centerY = (pos.y + pos.h / 2) * ratio;
-          
-          let pinX = 0, pinY = 0;
-          
-          const leftPins = comp.pins?.filter(p => p.side === 'left' || !p.side) || [];
-          const rightPins = comp.pins?.filter(p => p.side === 'right') || [];
-          const topPins = comp.pins?.filter(p => p.side === 'top') || [];
-          const bottomPins = comp.pins?.filter(p => p.side === 'bottom') || [];
-          
-          const pinSpacing = 2.54;
-
-          const findPinIdx = (arr: PinDefinition[]) => arr.findIndex(p => String(p.pinNumber) === String(conn.pin) || p.name === String(conn.pin));
-
-          let idx = -1;
-          if ((idx = findPinIdx(leftPins)) !== -1) {
-             pinX = centerX - halfW - 2.54; 
-             pinY = centerY - halfH + pinSpacing + (idx * pinSpacing * 2);
-          } else if ((idx = findPinIdx(rightPins)) !== -1) {
-             pinX = centerX + halfW + 2.54;
-             pinY = centerY - halfH + pinSpacing + (idx * pinSpacing * 2);
-          } else if ((idx = findPinIdx(topPins)) !== -1) {
-             const step = (halfW * 2) / (topPins.length + 1);
-             pinX = centerX - halfW + (step * (idx + 1));
-             pinY = centerY - halfH - 2.54;
-          } else if ((idx = findPinIdx(bottomPins)) !== -1) {
-             const step = (halfW * 2) / (bottomPins.length + 1);
-             pinX = centerX - halfW + (step * (idx + 1));
-             pinY = centerY + halfH + 2.54;
-          }
-
-          // Place Label
-          content += `  (label "${netName}" (at ${pinX.toFixed(2)} ${pinY.toFixed(2)} 0) (fields_autoplaced)\n`;
-          content += `    (effects (font (size 1.27 1.27)) (justify left bottom))\n`;
-          content += `    (uuid "${generateUUID()}")\n`;
-          content += `  )\n`;
-          
-          // Add a short wire stub to make it look connected
-          // content += `  (wire (pts (xy ${pinX.toFixed(2)} ${pinY.toFixed(2)}) (xy ${(pinX+1).toFixed(2)} ${pinY.toFixed(2)})) (stroke (width 0) (type solid)) (uuid "${generateUUID()}"))\n`;
+        xml += `<pin name="${pin.name}" x="${x.toFixed(2)}" y="${y.toFixed(2)}" length="middle" rot="${rot}"/>\n`;
       });
+
+      xml += `</symbol>\n`;
   });
 
-  content += `)\n`;
-  return content;
+  xml += `<devicesets>\n`;
+  data.components.forEach(comp => {
+      const symName = cleanName(comp.name);
+      xml += `<deviceset name="${symName}" prefix="U">\n`;
+      xml += `<gates>\n<gate name="G$1" symbol="${symName}" x="0" y="0"/>\n</gates>\n`;
+      xml += `</deviceset>\n`;
+  });
+  xml += `</devicesets>\n`;
+
+  xml += `</library>\n`;
+  xml += `</libraries>\n`;
+
+  // --- PARTS & INSTANCES ---
+  xml += `<parts>\n`;
+  data.components.forEach((comp, i) => {
+     const symName = cleanName(comp.name);
+     xml += `<part name="U${i+1}" library="AutoSchematicLib" deviceset="${symName}" device=""/>\n`;
+  });
+  xml += `</parts>\n`;
+
+  // --- SHEET ---
+  xml += `<sheets>\n<sheet>\n`;
+  xml += `<plain>\n</plain>\n`;
+  
+  xml += `<instances>\n`;
+  data.components.forEach((comp, i) => {
+     const pos = layoutPositions[comp.id];
+     if(!pos) return;
+     
+     // Convert Web Pos (Top-Left) to Eagle Pos (Center) and Invert Y
+     const webCenterX = pos.x + pos.w/2;
+     const webCenterY = pos.y + pos.h/2;
+     
+     const eagleX = webCenterX * SCALE;
+     const eagleY = -(webCenterY * SCALE); // Invert Y
+
+     xml += `<instance part="U${i+1}" gate="G$1" x="${eagleX.toFixed(2)}" y="${eagleY.toFixed(2)}"/>\n`;
+  });
+  xml += `</instances>\n`;
+
+  xml += `<busses>\n</busses>\n`;
+
+  // --- NETS (WIRES) ---
+  xml += `<nets>\n`;
+  
+  // Group routes by net
+  const netGroups: Record<string, Route[]> = {};
+  routes.forEach(r => {
+      if(!netGroups[r.netName]) netGroups[r.netName] = [];
+      netGroups[r.netName].push(r);
+  });
+
+  Object.entries(netGroups).forEach(([netName, netRoutes]) => {
+      const safeNetName = cleanName(netName);
+      xml += `<net name="${safeNetName}" class="0">\n`;
+      
+      netRoutes.forEach(route => {
+          xml += `<segment>\n`;
+          for(let i=0; i<route.path.length-1; i++) {
+              const p1 = route.path[i];
+              const p2 = route.path[i+1];
+              
+              const x1 = p1.x * SCALE;
+              const y1 = -(p1.y * SCALE); // Invert Y
+              const x2 = p2.x * SCALE;
+              const y2 = -(p2.y * SCALE); // Invert Y
+              
+              xml += `<wire x1="${x1.toFixed(2)}" y1="${y1.toFixed(2)}" x2="${x2.toFixed(2)}" y2="${y2.toFixed(2)}" width="0.1524" layer="91"/>\n`;
+          }
+          xml += `</segment>\n`;
+      });
+      xml += `</net>\n`;
+  });
+
+  xml += `</nets>\n`;
+  xml += `</sheet>\n`;
+  xml += `</sheets>\n`;
+  
+  xml += `</schematic>\n`;
+  xml += `</drawing>\n`;
+  xml += `</eagle>\n`;
+
+  return xml;
 };
+
+// Deprecated KiCad export kept for reference but unused
+export const generateKiCadSchematic = () => "";
